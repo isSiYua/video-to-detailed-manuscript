@@ -1,0 +1,4 @@
+interface:
+  display_name: "Video to Detailed Manuscript"
+  short_description: "Create and manage detailed illustrated video notes"
+  default_prompt: "Use $video-to-detailed-manuscript to turn this Bilibili link into a detailed illustrated Obsidian note."

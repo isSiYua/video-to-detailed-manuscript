@@ -1,0 +1,52 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+if [ -n "${VTM_PYTHON:-}" ]; then
+    if [ ! -x "$VTM_PYTHON" ]; then
+        printf '%s\n' "VTM_PYTHON is not executable: $VTM_PYTHON" >&2
+        exit 126
+    fi
+    if ! "$VTM_PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+        printf '%s\n' "VTM_PYTHON must be Python 3.10 or newer: $VTM_PYTHON" >&2
+        exit 126
+    fi
+    exec "$VTM_PYTHON" "$SCRIPT_DIR/video_manuscript.py" "$@"
+fi
+
+fallback=""
+needs_asr_runtime=false
+case "${1:-}" in
+    run|prepare-asr)
+        needs_asr_runtime=true
+        ;;
+esac
+
+for candidate in /usr/bin/python3.10 /usr/bin/python3 python3; do
+    if [ "${candidate#*/}" != "$candidate" ]; then
+        [ -x "$candidate" ] || continue
+    else
+        command -v "$candidate" >/dev/null 2>&1 || continue
+    fi
+    if ! "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+        continue
+    fi
+    [ -n "$fallback" ] || fallback="$candidate"
+    # Management commands must stay responsive even while an ASR worker is
+    # consuming CPU. Only the two commands that can actually load FunASR pay
+    # the module-import/runtime-selection cost.
+    if [ "$needs_asr_runtime" = false ]; then
+        exec "$candidate" "$SCRIPT_DIR/video_manuscript.py" "$@"
+    fi
+    if "$candidate" -c 'import funasr' >/dev/null 2>&1; then
+        exec "$candidate" "$SCRIPT_DIR/video_manuscript.py" "$@"
+    fi
+done
+
+if [ -z "$fallback" ]; then
+    printf '%s\n' "No usable Python 3 interpreter was found" >&2
+    exit 127
+fi
+
+exec "$fallback" "$SCRIPT_DIR/video_manuscript.py" "$@"

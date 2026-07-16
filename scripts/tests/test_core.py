@@ -1,0 +1,4218 @@
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import io
+import json
+import os
+import sys
+import tempfile
+import unittest
+import urllib.error
+import zipfile
+from pathlib import Path
+from unittest.mock import patch
+
+from vtm_core import PIPELINE_VERSION
+from vtm_core.asr import FUNASR_BATCH_SECONDS, faster_whisper_model_path, normalize_segments, parse_srt
+from vtm_core.bilibili import BilibiliClient
+from vtm_core.llm import OpenAICompatibleClient
+from vtm_core.direct_manuscript import (
+    DIRECT_DETAIL_PROMPT,
+    DIRECT_OUTLINE_PROMPT,
+    DIRECT_REVIEW_PROMPT,
+    DIRECT_WRITER_PROMPT,
+    _apply_narrow_final_repairs,
+    _call_asr_reconciliation,
+    _paragraphs_from_document,
+    _require_final_copyedit,
+    _verified_visual_clues,
+    complete_direct_manuscript,
+    create_direct_plan,
+    create_direct_manuscript,
+    create_visual_request_plan,
+    merge_visual_requests,
+    visual_requests_from_plan,
+)
+from vtm_core.models import Frame, InformationUnit, OutlineSection, Paragraph, Segment
+from vtm_core.manuscript import (
+    _adjudicate_final_audit,
+    _anchor_supported as manuscript_anchor_supported,
+    _anchors as manuscript_anchors,
+    _extract_units,
+    _plan_outline,
+    _proofread_asr_residue,
+    create_manuscript,
+    manuscript_quality_report,
+)
+from vtm_core.output import compose_markdown, plan_frame_evidence, plan_frame_evidence_groups
+from vtm_core.pipeline import Options, _resume_checkpoint, run
+from vtm_core.bilibili import VideoInfo
+from vtm_core.transcript import (
+    BATCH_EDIT_MAX_ATTEMPTS,
+    FAITHFUL_SYSTEM_PROMPT,
+    FULL_MANUSCRIPT_REPAIR_ATTEMPTS,
+    REFINEMENT_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+    _chunk_context,
+    _load_checkpoint_chunks,
+    _paragraphs_from_response,
+    _proofread_asr_artifacts,
+    _save_checkpoint_chunks,
+    _validate_full_manuscript,
+    edit_transcript,
+    enrich_with_visual_evidence,
+    exact_anchors,
+    chunk_segments,
+)
+from vtm_core.tasks import get_task, list_tasks, reserve_task, update_task
+from vtm_core.utils import safe_name
+from vtm_core.visual import (
+    DEFAULT_VISION_FRAME_BUDGET,
+    MAX_ADAPTIVE_VISION_FRAME_BUDGET,
+    MAX_PAID_VISION_REVIEWS_PER_MINUTE,
+    adaptive_vision_frame_budget,
+    asset_filename,
+    candidate_times,
+    average_hash,
+    describe_if_needed,
+    duplicate_distance_threshold,
+    extract_useful_frames,
+    hash_distance,
+    ocr_text_is_usable,
+    quality,
+    recapture_retained_frames,
+    semantic_vision_frame_budget,
+    vision_priority_ids,
+    vision_priority_ids_for_requests,
+)
+from video_manuscript import (
+    bundle_job,
+    cancel_job,
+    confirm_bulk_delete,
+    contract,
+    delete_job,
+    default_vault,
+    format_progress,
+    format_gateway_completion,
+    find_existing_video_task,
+    load_runtime_env,
+    main,
+    plan_bulk_delete,
+    progress_label,
+    restore_job,
+    duplicate_skill_paths,
+    GatewayProgressReporter,
+    send_hermes_document,
+    submit_detached,
+    evaluate_text_core,
+)
+
+
+class FakeClient(OpenAICompatibleClient):
+    def __init__(self, response: dict):
+        self.response = response
+
+    def chat(self, messages, **kwargs):
+        return "```json\n" + json.dumps(self.response, ensure_ascii=False) + "\n```"
+
+
+class SequenceClient(OpenAICompatibleClient):
+    def __init__(self, responses: list[dict]):
+        self.responses = list(responses)
+        self.calls = 0
+
+    def chat(self, messages, **kwargs):
+        response = self.responses[min(self.calls, len(self.responses) - 1)]
+        self.calls += 1
+        return "```json\n" + json.dumps(response, ensure_ascii=False) + "\n```"
+
+
+class RawSequenceClient(SequenceClient):
+    def chat(self, messages, **kwargs):
+        response = self.responses[min(self.calls, len(self.responses) - 1)]
+        self.calls += 1
+        if isinstance(response, str):
+            return response
+        return "```json\n" + json.dumps(response, ensure_ascii=False) + "\n```"
+
+
+def manuscript_responses(
+    text: str = "完整内容。", *, publication_copyedit: bool = False
+) -> list[dict]:
+    responses = [
+        {"units": [{
+            "start_source_id": "s000001", "action": "keep", "kind": "claim",
+            "topic": "核心内容", "text": text, "details": [], "drop_reason": None,
+        }]},
+        {"corrections": []},
+        {"sections": [{
+            "start_unit_id": "u000001", "title": "核心内容说明",
+            "objective": "完整说明视频内容", "format_hint": "prose",
+        }]},
+        {"paragraphs": [{"start_unit_id": "u000001", "text": text}]},
+    ]
+    if publication_copyedit:
+        responses.append({"paragraphs": [{"start_unit_id": "u000001", "text": text}]})
+        responses.append(
+            {
+                "checked_section_ids": ["sec001"],
+                "corrections": [],
+                "unresolved": [],
+            }
+        )
+    responses.append(audit_pass("sec001"))
+    if publication_copyedit:
+        responses.append(
+            {
+                "checked_section_ids": ["sec001"],
+                "corrections": [],
+                "unresolved": [],
+            }
+        )
+    return responses
+
+
+def direct_manuscript_responses(text: str = "完整内容。") -> list[dict]:
+    plan = {
+        "sections": [
+            {
+                "title": "完整内容",
+                "objective": "完整说明内容",
+                "paragraphs": [
+                    {
+                        "start_source_id": "s000001",
+                        "focus": "核心内容",
+                        "must_keep": ["完整内容"],
+                    }
+                ],
+            }
+        ]
+    }
+    document = {
+        "sections": [
+            {
+                "title": "完整内容",
+                "paragraphs": [
+                    {"start_source_id": "s000001", "text": text}
+                ],
+            }
+        ]
+    }
+    return [plan, document, document, document]
+
+
+def audit_pass(*section_ids: str) -> dict:
+    return {
+        "verdict": "pass",
+        "section_reviews": [
+            {"section_id": section_id, "status": "pass", "reason": "内容完整且已编辑"}
+            for section_id in section_ids
+        ],
+        "issues": [],
+    }
+
+
+def audit_repair(section_statuses: dict[str, str], issues: list[dict]) -> dict:
+    return {
+        "verdict": "repair",
+        "section_reviews": [
+            {"section_id": section_id, "status": status, "reason": "需要定向修复" if status == "repair" else "通过"}
+            for section_id, status in section_statuses.items()
+        ],
+        "issues": issues,
+    }
+
+
+class CoreTests(unittest.TestCase):
+    def test_deterministic_contract_exposes_the_non_negotiable_rules(self):
+        payload = contract()
+        self.assertEqual(payload["pipeline_version"], PIPELINE_VERSION)
+        self.assertTrue(
+            payload["source_id_audit"]["every_source_assigned_to_one_chronological_paragraph"]
+        )
+        self.assertFalse(payload["source_id_audit"]["model_copies_individual_ids"])
+        self.assertEqual(payload["source_id_audit"]["model_output_fields"], ["start_source_id"])
+        self.assertEqual(
+            payload["source_id_audit"]["assignment_method"],
+            "deterministic_paragraph_start_ranges",
+        )
+        self.assertFalse(payload["source_id_audit"]["filler_text_is_forced_into_prose"])
+        self.assertEqual(
+            payload["semantic_editing"]["editing_stages"],
+            [
+                "whole_transcript_structure_and_visual_request_planning",
+                "bounded_prewrite_asr_and_term_reconciliation",
+                "golden_style_structured_writing_with_visual_evidence",
+                "whole_transcript_detail_restoration",
+                "golden_style_concise_copyedit",
+            ],
+        )
+        self.assertEqual(payload["semantic_editing"]["document_passes"], 4)
+        self.assertTrue(payload["semantic_editing"]["writer_reads_complete_transcript"])
+        self.assertTrue(
+            payload["semantic_editing"]["writer_reads_visual_evidence_before_drafting"]
+        )
+        self.assertTrue(
+            payload["semantic_editing"]["writer_reads_bundled_golden_style_reference"]
+        )
+        self.assertTrue(
+            payload["semantic_editing"][
+                "each_planned_paragraph_receives_complete_local_source_excerpt"
+            ]
+        )
+        self.assertTrue(
+            payload["semantic_editing"][
+                "detail_and_final_receive_aligned_source_draft_packets"
+            ]
+        )
+        self.assertFalse(payload["semantic_editing"]["style_reference_facts_copyable"])
+        self.assertTrue(
+            payload["semantic_editing"]["reviewer_reads_complete_transcript_and_draft"]
+        )
+        self.assertTrue(
+            payload["semantic_editing"]["llm_plans_sections_paragraphs_and_sentence_rewriting"]
+        )
+        self.assertTrue(
+            payload["semantic_editing"]["final_with_obvious_residue_retried_once"]
+        )
+        self.assertFalse(payload["semantic_editing"]["program_decides_semantic_importance"])
+        self.assertFalse(payload["developer_evaluation"]["reserves_task_number"])
+        self.assertFalse(payload["developer_evaluation"]["writes_vault"])
+        self.assertFalse(payload["developer_evaluation"]["downloads_media"])
+        self.assertTrue(payload["semantic_editing"]["resume_reuses_persisted_raw_transcript"])
+        self.assertTrue(payload["semantic_editing"]["semantic_checkpoint_source_signature"])
+        self.assertEqual(payload["progress"]["failure_terminal"], "[6/6 · FAILED]")
+        self.assertFalse(payload["tasks"]["bare_number_is_instruction"])
+        self.assertTrue(payload["tasks"]["download_is_one_shot_attachment"])
+        self.assertTrue(payload["preservation"]["detail_preservation_is_semantic_llm_review"])
+        self.assertFalse(payload["preservation"]["mechanical_word_retention_gate"])
+        self.assertTrue(payload["visuals"]["classification_failure_keeps_aligned_original"])
+        self.assertTrue(payload["visuals"]["paid_vision_frames_temporally_distributed"])
+        self.assertTrue(
+            payload["visuals"]["planner_requested_ranges_prioritized_for_paid_vision"]
+        )
+        self.assertFalse(
+            payload["visuals"]["medium_or_low_confidence_visual_text_publishable"]
+        )
+        self.assertFalse(payload["visuals"]["partial_or_unverified_visual_text_publishable"])
+        self.assertEqual(
+            payload["visuals"]["copyable_visual_text_minimum_ocr_confidence"], 50
+        )
+        self.assertFalse(payload["visuals"]["uncertain_visual_description_used_as_alt_text"])
+        self.assertTrue(payload["visuals"]["nearby_duplicate_aligned_frames_removed"])
+        self.assertEqual(payload["tasks"]["downloadable_statuses"], ["complete"])
+        self.assertFalse(payload["secrets"]["secret_values_printed_or_searched"])
+
+    def test_direct_manuscript_uses_whole_document_writer_and_reviewer(self):
+        segments = [
+            Segment("s000001", 0.0, 2.0, "嗯，先打开设置。"),
+            Segment("s000002", 2.0, 4.0, "选择语言，重启后生效。"),
+            Segment("s000003", 4.0, 6.0, "最后检查输出。"),
+        ]
+        draft = {
+            "sections": [
+                {
+                    "title": "设置与检查",
+                    "paragraphs": [
+                        {"start_source_id": "s000001", "text": "打开设置并选择语言。"}
+                    ],
+                }
+            ]
+        }
+        final = {
+            "sections": [
+                {
+                    "title": "完成语言设置",
+                    "paragraphs": [
+                        {
+                            "start_source_id": "s000001",
+                            "text": "打开设置并选择语言；重新启动后，语言设置才会生效。",
+                        }
+                    ],
+                },
+                {
+                    "title": "验证输出",
+                    "paragraphs": [
+                        {"start_source_id": "s000003", "text": "最后检查输出结果。"}
+                    ],
+                },
+            ]
+        }
+        plan = {
+            "sections": [
+                {
+                    "title": "完成语言设置",
+                    "objective": "完成设置并验证",
+                    "paragraphs": [
+                        {
+                            "start_source_id": "s000001",
+                            "focus": "语言设置",
+                            "must_keep": ["重启后生效"],
+                        },
+                        {
+                            "start_source_id": "s000003",
+                            "focus": "检查输出",
+                            "must_keep": ["验证结果"],
+                        },
+                    ],
+                }
+            ]
+        }
+        client = SequenceClient([plan, draft, final, final])
+        paragraphs, coverage = create_direct_manuscript(
+            segments, client, context="设置教程"
+        )
+        self.assertEqual(client.calls, 4)
+        self.assertEqual(paragraphs[0].source_ids, ["s000001", "s000002"])
+        self.assertEqual(paragraphs[1].source_ids, ["s000003"])
+        self.assertIn("重新启动后", paragraphs[0].text)
+        self.assertEqual(
+            coverage["editing_architecture"],
+            "whole_transcript_plan_visual_reconcile_write_restore_copyedit",
+        )
+        self.assertEqual(coverage["represented_source_count"], 3)
+
+    def test_direct_document_requires_chapters_for_long_video(self):
+        segments = [
+            Segment("s000001", 0.0, 100.0, "第一部分。"),
+            Segment("s000002", 100.0, 220.0, "第二部分。"),
+        ]
+        payload = {
+            "sections": [
+                {
+                    "title": "全部内容",
+                    "paragraphs": [
+                        {"start_source_id": "s000001", "text": "把所有内容放在一节。"}
+                    ],
+                }
+            ]
+        }
+        with self.assertRaisesRegex(ValueError, "长视频必须"):
+            _paragraphs_from_document(payload, segments)
+
+    def test_direct_prompts_assign_semantics_to_deepseek(self):
+        self.assertIn("只规划文章，不写正文", DIRECT_OUTLINE_PROMPT)
+        self.assertIn("must_keep", DIRECT_OUTLINE_PROMPT)
+        self.assertIn("visual_requests", DIRECT_OUTLINE_PROMPT)
+
+    def test_asr_reconciliation_release_uses_reviewed_text_prompts(self):
+        expected = {
+            "outline": "6612f3bc5d17faee86f3d5b6b943ea71390b31000a05c0e423133b452f0465f5",
+            "writer": "35a82480f03ad66ef15804c7ca9f75f7d6452b8e03d773ade19cd16bae28ee6d",
+            "detail": "40db15ed73c920bce274baca61aff4ebc05dfab212be992d6e1e6efd965b9497",
+            "review": "f9e22917db7f869582d86f6f2f69aedc724a0174804b95befbd5963a50f2d3f1",
+        }
+        actual = {
+            "outline": hashlib.sha256(DIRECT_OUTLINE_PROMPT.encode()).hexdigest(),
+            "writer": hashlib.sha256(DIRECT_WRITER_PROMPT.encode()).hexdigest(),
+            "detail": hashlib.sha256(DIRECT_DETAIL_PROMPT.encode()).hexdigest(),
+            "review": hashlib.sha256(DIRECT_REVIEW_PROMPT.encode()).hexdigest(),
+        }
+        self.assertEqual(actual, expected)
+        self.assertIn("严格按照规划写成", DIRECT_WRITER_PROMPT)
+        self.assertIn("完整带时间戳字幕", DIRECT_WRITER_PROMPT)
+        self.assertIn("保留原字幕中的观点", DIRECT_WRITER_PROMPT)
+        self.assertIn("golden_style_reference", DIRECT_WRITER_PROMPT)
+        self.assertIn("详细不等于重复", DIRECT_WRITER_PROMPT)
+        self.assertIn("source_excerpt", DIRECT_WRITER_PROMPT)
+        self.assertIn("点赞关注请求", DIRECT_OUTLINE_PROMPT)
+        self.assertIn("补充、整理后的完整文稿", DIRECT_DETAIL_PROMPT)
+        self.assertIn("初稿是否为了简洁而漏掉", DIRECT_DETAIL_PROMPT)
+        self.assertIn("golden_style_reference", DIRECT_REVIEW_PROMPT)
+        self.assertIn("一句话能说清不用两句", DIRECT_REVIEW_PROMPT)
+        self.assertIn("补回 current_draft 遗漏", DIRECT_REVIEW_PROMPT)
+        self.assertIn("相邻片段", DIRECT_OUTLINE_PROMPT)
+        self.assertIn("ASR 不确定只影响精确措辞", DIRECT_OUTLINE_PROMPT)
+        self.assertIn("不得连同周围明确的背景", DIRECT_WRITER_PROMPT)
+        self.assertIn("不能因为局部术语不确定", DIRECT_DETAIL_PROMPT)
+        self.assertIn("只删去不可靠的精确措辞", DIRECT_REVIEW_PROMPT)
+        self.assertIn("article_plan 只负责结构，不是事实来源", DIRECT_WRITER_PROMPT)
+        self.assertIn("否定词、限制词和比较方向不得被反转", DIRECT_DETAIL_PROMPT)
+        self.assertIn("可以少改或不改", DIRECT_REVIEW_PROMPT)
+
+    def test_writer_receives_visual_evidence_and_bundled_golden_style_before_drafting(self):
+        segments = [
+            Segment("s000001", 0.0, 3.0, "打开设置并选择语言。"),
+            Segment("s000002", 3.0, 6.0, "重新打开后生效。"),
+        ]
+        plan = {
+            "sections": [{
+                "title": "设置",
+                "objective": "完成设置",
+                "paragraphs": [{
+                    "start_source_id": "s000001",
+                    "focus": "语言设置",
+                    "must_keep": ["重新打开后生效"],
+                    "visual_requests": [{
+                        "time_start": 0.0,
+                        "time_end": 4.0,
+                        "purpose": "确认设置入口",
+                        "expected_kind": "ui",
+                    }],
+                }],
+            }]
+        }
+        document = {
+            "sections": [{
+                "title": "设置",
+                "paragraphs": [{
+                    "start_source_id": "s000001",
+                    "text": "打开设置并选择语言，重新打开后生效。",
+                }],
+            }]
+        }
+
+        class CapturingClient(SequenceClient):
+            def __init__(self, responses):
+                super().__init__(responses)
+                self.messages = []
+
+            def chat(self, messages, **kwargs):
+                self.messages.append(messages)
+                return super().chat(messages, **kwargs)
+
+        client = CapturingClient([
+            plan,
+            {"corrections": []},
+            document,
+            document,
+            document,
+        ])
+        prepared = create_direct_plan(segments, client, context="设置教程")
+        frames = [Frame(
+            2.0,
+            "/tmp/frame.png",
+            source_ids=["s000001"],
+            ocr_text="设置 常规 语言",
+            ocr_confidence=88,
+            vision_description="设置界面显示常规与语言选项",
+        )]
+        _paragraphs, coverage = complete_direct_manuscript(
+            segments, client, prepared, context="设置教程", frames=frames
+        )
+        writer_payload = json.loads(client.messages[2][1]["content"])
+        detail_payload = json.loads(client.messages[3][1]["content"])
+        final_payload = json.loads(client.messages[4][1]["content"])
+        self.assertEqual(writer_payload["visual_evidence"][0]["timestamp"], 2.0)
+        self.assertIn("设置界面", writer_payload["visual_evidence"][0]["vision_description"])
+        self.assertIn(
+            "重新打开后生效",
+            writer_payload["article_plan"]["sections"][0]["paragraphs"][0][
+                "source_excerpt"
+            ],
+        )
+        self.assertIn("one clear purpose per paragraph", writer_payload["golden_style_reference"])
+        self.assertEqual(
+            detail_payload["paragraph_evidence_packets"][0]["current_text"],
+            "打开设置并选择语言，重新打开后生效。",
+        )
+        self.assertIn("source_excerpt", final_payload["paragraph_evidence_packets"][0])
+        self.assertIn("golden_style_reference", final_payload)
+        self.assertTrue(coverage["visual_evidence_before_writing"])
+        self.assertTrue(coverage["golden_style_reference"])
+        self.assertEqual(coverage["llm_targeted_asr_reconciliation_passes"], 1)
+
+    def test_targeted_reconciliation_overrides_bad_plan_term_and_restores_split_sentence(self):
+        segments = [
+            Segment("s000001", 0.0, 2.0, "最终切换到他们叫 EGICS 的方式。"),
+            Segment("s000002", 2.0, 4.0, "Rap so process payment。"),
+            Segment("s000003", 4.0, 6.0, "就精确命中不存在于语义漂移的问题。"),
+        ]
+        plan = {
+            "sections": [{
+                "title": "精确搜索",
+                "objective": "解释精确搜索",
+                "paragraphs": [{
+                    "start_source_id": "s000001",
+                    "focus": "说明 EGICS 和精确匹配",
+                    "must_keep": ["最终改用 EGICS", "武装太设计"],
+                    "asr_suspects": [{
+                        "source_text": "EGICS",
+                        "conservative_repair": "EGICS",
+                        "confidence": "medium",
+                    }, {
+                        "source_text": "Rap so process payment 就精确命中不存在于语义漂移的问题",
+                        "conservative_repair": None,
+                        "confidence": "low",
+                    }, {
+                        "source_text": "武装太设计",
+                        "conservative_repair": "无状态设计",
+                        "confidence": "high",
+                    }],
+                    "visual_requests": [],
+                }],
+            }],
+        }
+        reconciliation = {
+            "items": [
+                {
+                    "item_id": "r001",
+                    "action": "correct",
+                    "replacement": "agentic search",
+                    "required_anchors": ["agentic search"],
+                    "confidence": "high",
+                    "basis": "visible_text",
+                },
+                {
+                    "item_id": "r002",
+                    "action": "correct",
+                    "replacement": "grep 搜 processPayment 就是精确命中，不存在语义漂移问题",
+                    "required_anchors": ["processPayment", "精确命中", "不存在语义漂移"],
+                    "confidence": "medium",
+                    "basis": "adjacent_context",
+                },
+            ]
+        }
+        document = {
+            "sections": [{
+                "title": "精确搜索",
+                "paragraphs": [{
+                    "start_source_id": "s000001",
+                    "text": "最终改用 agentic search。grep 搜 processPayment 就是精确命中，不存在语义漂移问题。",
+                }],
+            }],
+        }
+        client = SequenceClient([reconciliation, document, document, document])
+        frames = [Frame(
+            1.0,
+            "/tmp/agentic.png",
+            source_ids=["s000001"],
+            ocr_text="agentic search",
+            ocr_confidence=95,
+            vision_description="Boris 原文清晰显示 agentic search。",
+        )]
+        paragraphs, coverage = complete_direct_manuscript(
+            segments,
+            client,
+            plan,
+            context="Claude Code 搜索方式",
+            frames=frames,
+        )
+        self.assertEqual(client.calls, 4)
+        self.assertIn("agentic search", paragraphs[0].text)
+        self.assertIn("不存在语义漂移问题", paragraphs[0].text)
+        self.assertNotIn("EGICS", paragraphs[0].text)
+        self.assertEqual(
+            coverage["asr_reconciliation"]["corrections"][0]["basis"],
+            "visible_text",
+        )
+        self.assertNotIn(
+            "UNIX 设计",
+            [
+                item["replacement"]
+                for item in coverage["asr_reconciliation"]["corrections"]
+            ],
+        )
+
+    def test_verified_visual_clues_accept_qwen_bold_exact_text(self):
+        clues = _verified_visual_clues([{
+            "timestamp": 96.4,
+            "source_ids": ["s000054"],
+            "ocr": "",
+            "ocr_confidence": 0,
+            "vision_description": (
+                "纯文字。中央黄色横幅内文字：**不存在语义漂移的问题**"
+            ),
+        }])
+        self.assertEqual(
+            clues[0]["exact_visible_text"],
+            ["不存在语义漂移的问题"],
+        )
+
+    def test_visible_conflict_adds_unflagged_uppercase_phonetic_term_to_same_reconciliation(self):
+        segments = [
+            Segment("s000001", 0, 2, "最终切换到了他们叫 EGICS 的方式。"),
+        ]
+        client = SequenceClient([{
+            "items": [{
+                "item_id": "r001",
+                "action": "correct",
+                "replacement": "agentic search",
+                "required_anchors": ["agentic search"],
+                "confidence": "high",
+                "basis": "visible_text",
+            }],
+        }])
+        result = _call_asr_reconciliation(
+            client,
+            segments=segments,
+            plan={"sections": []},
+            visual_evidence=[{
+                "timestamp": 1,
+                "source_ids": ["s000001"],
+                "ocr": "agentic search",
+                "ocr_confidence": 95,
+                "vision_description": "",
+            }],
+            suspect_contexts=[],
+        )
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(
+            result["corrections"][0]["replacement"], "agentic search"
+        )
+
+    def test_asr_suspect_deterministically_adds_visual_request(self):
+        segments = [
+            Segment("s000001", 10.0, 12.0, "先解释背景。"),
+            Segment("s000002", 12.0, 14.0, "Rap so process payment。"),
+            Segment("s000003", 14.0, 16.0, "再进入下一部分。"),
+        ]
+        plan = {
+            "sections": [{
+                "paragraphs": [{
+                    "start_source_id": "s000001",
+                    "asr_suspects": [{
+                        "source_text": "Rap so process payment",
+                        "conservative_repair": None,
+                        "confidence": "low",
+                    }],
+                    "visual_requests": [],
+                }],
+            }],
+        }
+        requests = visual_requests_from_plan(plan, segments)
+        self.assertEqual(len(requests), 1)
+        self.assertIn("ASR 可疑", requests[0]["purpose"])
+        self.assertAlmostEqual(requests[0]["time_start"], 10.5)
+        self.assertAlmostEqual(requests[0]["time_end"], 15.5)
+
+    def test_planner_visual_requests_are_flattened_and_prioritized_within_budget(self):
+        plan = {
+            "sections": [{
+                "paragraphs": [{
+                    "visual_requests": [{
+                        "time_start": 40,
+                        "time_end": 50,
+                        "purpose": "确认流程图",
+                        "expected_kind": "diagram",
+                    }]
+                }]
+            }]
+        }
+        requests = visual_requests_from_plan(plan)
+        self.assertEqual(requests[0]["purpose"], "确认流程图")
+        outside = Frame(10.0, "a.png")
+        requested = Frame(45.0, "b.png")
+        selected = [(outside, 99.0), (requested, 1.0)]
+        chosen = vision_priority_ids_for_requests(selected, 1, 60.0, requests)
+        self.assertEqual(chosen, {id(requested)})
+
+    def test_asr_visual_ranges_get_both_endpoints_without_increasing_budget(self):
+        before = Frame(10.0, "before.png")
+        first_clause = Frame(94.8, "identifier.png")
+        middle = Frame(95.5, "middle.png")
+        polarity = Frame(96.5, "polarity.png")
+        ordinary = Frame(150.0, "ordinary.png")
+        selected = [
+            (before, 9.0),
+            (first_clause, 3.0),
+            (middle, 8.0),
+            (polarity, 2.0),
+            (ordinary, 10.0),
+        ]
+        requests = [{
+            "time_start": 94.0,
+            "time_end": 97.0,
+            "purpose": "核验 ASR 可疑术语或断句",
+            "expected_kind": "text",
+        }, {
+            "time_start": 145.0,
+            "time_end": 155.0,
+            "purpose": "查看普通架构图",
+            "expected_kind": "diagram",
+        }]
+        chosen = vision_priority_ids_for_requests(
+            selected, 3, 200.0, requests
+        )
+        self.assertEqual(
+            chosen,
+            {id(first_clause), id(polarity), id(ordinary)},
+        )
+
+    def test_dedicated_visual_planner_can_request_dense_ppt_range_without_fixed_interval(self):
+        segments = [
+            Segment("s1", 0, 8, "这是课程大纲。"),
+            Segment("s2", 8, 24, "下面演示完整流程和最终成品图。"),
+        ]
+        client = FakeClient({
+            "requests": [
+                {
+                    "time_start": 0,
+                    "time_end": 24,
+                    "purpose": "读取课程大纲、操作流程和成品图中的独有细节",
+                    "expected_kind": "ui",
+                }
+            ]
+        })
+        requests = create_visual_request_plan(
+            segments,
+            client,
+            {"sections": [{"title": "课程", "paragraphs": []}]},
+        )
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["time_end"], 24)
+        self.assertIn("成品图", requests[0]["purpose"])
+
+    def test_visual_request_merge_removes_same_kind_near_duplicate_windows(self):
+        merged = merge_visual_requests(
+            [{"time_start": 10, "time_end": 20, "purpose": "A", "expected_kind": "text"}],
+            [
+                {"time_start": 10.5, "time_end": 20.5, "purpose": "B", "expected_kind": "text"},
+                {"time_start": 10, "time_end": 20, "purpose": "C", "expected_kind": "diagram"},
+            ],
+        )
+        self.assertEqual(len(merged), 2)
+
+    def test_final_copyedit_rejects_promotional_outro(self):
+        segments = [Segment("s000001", 0.0, 2.0, "如果有用请点赞三连。")]
+        payload = {
+            "sections": [{
+                "title": "片尾",
+                "paragraphs": [{
+                    "start_source_id": "s000001",
+                    "text": "如果有用请点赞三连。",
+                }],
+            }]
+        }
+        with self.assertRaisesRegex(ValueError, "点赞"):
+            _require_final_copyedit(payload, payload, segments)
+
+    def test_compose_markdown_renders_real_tutorial_subheading(self):
+        with tempfile.TemporaryDirectory() as temp:
+            note = Path(temp) / "note.md"
+            compose_markdown(
+                note,
+                {"title": "教程", "url": "https://example.com", "bvid": "BV1", "owner": "UP"},
+                [Paragraph(["s1"], "进入设置并选择语言。", heading="准备", subheading="切换中文界面")],
+                [],
+            )
+            text = note.read_text(encoding="utf-8")
+            self.assertIn("## 准备", text)
+            self.assertIn("### 切换中文界面", text)
+
+    def test_identical_final_with_obvious_editorial_residue_is_rejected(self):
+        segments = [Segment("s000001", 0.0, 2.0, "同学们先打开设置。")]
+        unchanged = {
+            "sections": [{
+                "title": "设置",
+                "paragraphs": [{
+                    "start_source_id": "s000001",
+                    "text": "同学们先打开设置。",
+                }],
+            }]
+        }
+        with self.assertRaisesRegex(ValueError, "实际修订"):
+            _require_final_copyedit(unchanged, unchanged, segments)
+
+    def test_identical_clean_final_is_allowed(self):
+        segments = [Segment("s000001", 0.0, 2.0, "打开设置。")]
+        unchanged = {
+            "sections": [{
+                "title": "设置",
+                "paragraphs": [{
+                    "start_source_id": "s000001",
+                    "text": "打开设置。",
+                }],
+            }]
+        }
+        _require_final_copyedit(unchanged, unchanged, segments)
+
+    def test_changed_final_with_confirmed_asr_residue_is_repaired(self):
+        segments = [Segment("s000001", 0.0, 2.0, "作者标题年份来源卷积页码。")]
+        current = {
+            "sections": [{
+                "title": "字段",
+                "paragraphs": [{
+                    "start_source_id": "s000001",
+                    "text": "文件包含作者、标题和年份。",
+                }],
+            }]
+        }
+        candidate = {
+            "sections": [{
+                "title": "字段",
+                "paragraphs": [{
+                    "start_source_id": "s000001",
+                    "text": "文件包含作者、标题、年份、来源和卷积页码。",
+                }],
+            }]
+        }
+        _require_final_copyedit(candidate, current, segments)
+        self.assertEqual(
+            candidate["sections"][0]["paragraphs"][0]["text"],
+            "文件包含作者、标题、年份、来源和卷、期、页码。",
+        )
+
+    def test_regression_confirmed_platform_asr_fragment_is_repaired_conservatively(self):
+        payload = {
+            "sections": [{
+                "title": "平台",
+                "paragraphs": [{
+                    "start_source_id": "s000001",
+                    "text": "作者引入自带超期刊文献的智能化学术写作平台。",
+                }],
+            }]
+        }
+        count = _apply_narrow_final_repairs(payload)
+        self.assertEqual(count, 1)
+        self.assertIn(
+            "具备文献处理能力",
+            payload["sections"][0]["paragraphs"][0]["text"],
+        )
+
+    def test_real_task_38_final_residues_are_normalized_without_rewriting_paragraph(self):
+        payload = {
+            "sections": [{
+                "title": "总结",
+                "paragraphs": [{
+                    "start_source_id": "s000001",
+                    "text": (
+                        "作者引入具备文献处理能力能力的 SY paper，"
+                        "三十分钟完成一篇参考论文。"
+                    ),
+                }],
+            }]
+        }
+        count = _apply_narrow_final_repairs(payload)
+        self.assertEqual(count, 3)
+        self.assertEqual(
+            payload["sections"][0]["paragraphs"][0]["text"],
+            "作者引入具备文献处理能力的 SY Paper，三十分钟完成一篇论文初稿。",
+        )
+
+    def test_final_audit_adjudication_can_dismiss_style_only_objection(self):
+        sections = [
+            OutlineSection(
+                id="sec001",
+                title="执行与等待",
+                objective="保留操作过程",
+                format_hint="prose",
+                unit_ids=["u000001"],
+            )
+        ]
+        units = [
+            InformationUnit(
+                id="u000001",
+                source_ids=["s000001"],
+                start=0.0,
+                end=2.0,
+                action="keep",
+                kind="example",
+                topic="等待期间",
+                text="任务运行时可以去食堂吃饭。",
+                details=[],
+                drop_reason=None,
+            )
+        ]
+        paragraphs = {
+            "sec001": [
+                Paragraph(
+                    source_ids=["s000001"],
+                    text="任务运行期间，用户可以去食堂吃饭。",
+                    start=0.0,
+                    end=2.0,
+                    heading="执行与等待",
+                )
+            ]
+        }
+        client = FakeClient(
+            {
+                "decisions": [
+                    {
+                        "issue_index": 0,
+                        "valid": False,
+                        "reason": "这是来源明确表达的场景例子，不是编辑腔。",
+                    }
+                ]
+            }
+        )
+        result = _adjudicate_final_audit(
+            sections,
+            units,
+            paragraphs,
+            [
+                {
+                    "section_id": "sec001",
+                    "kind": "presenter_voice",
+                    "instruction": "删除去食堂吃饭的内容",
+                }
+            ],
+            client,
+            "论文教程",
+        )
+        self.assertEqual(result["valid_issue_indices"], [])
+        self.assertFalse(result["decisions"][0]["valid"])
+
+    def test_asr_residue_can_replace_every_repeated_bad_fragment(self):
+        sections = [
+            OutlineSection(
+                id="sec001", title="步骤", unit_ids=["u000001"],
+                objective="说明操作", format_hint="prose",
+            )
+        ]
+        units = [
+            InformationUnit(
+                id="u000001", source_ids=["s000001"], start=0.0, end=2.0,
+                action="keep", kind="step", topic="参数",
+                text="切换指文后再次检查切换指文。", details=["检查相关参数"],
+            )
+        ]
+        paragraphs = {
+            "sec001": [
+                Paragraph(
+                    source_ids=["s000001"],
+                    text="切换指文后，再次检查切换指文。",
+                    start=0.0, end=2.0, heading="步骤",
+                )
+            ]
+        }
+        client = FakeClient(
+            {
+                "checked_section_ids": ["sec001"],
+                "corrections": [
+                    {
+                        "section_id": "sec001", "paragraph_index": 0,
+                        "original": "切换指文", "replacement": "相关参数",
+                        "replace_all": True, "reason": "同一乱码重复出现",
+                    }
+                ],
+                "unresolved": [],
+            }
+        )
+        result = _proofread_asr_residue(sections, units, paragraphs, client, "教程")
+        self.assertEqual(paragraphs["sec001"][0].text, "相关参数后，再次检查相关参数。")
+        self.assertEqual(result["corrections"][0]["replaced_count"], 2)
+
+    def test_asr_residue_can_replace_one_numbered_occurrence(self):
+        sections = [
+            OutlineSection(
+                id="sec001", title="步骤", unit_ids=["u000001"],
+                objective="说明操作", format_hint="prose",
+            )
+        ]
+        units = [
+            InformationUnit(
+                id="u000001", source_ids=["s000001"], start=0.0, end=2.0,
+                action="keep", kind="step", topic="参数",
+                text="检查选项，保留另一个选项。", details=["检查选项"],
+            )
+        ]
+        paragraphs = {
+            "sec001": [
+                Paragraph(
+                    source_ids=["s000001"],
+                    text="选项用于输入，另一个选项用于输出。",
+                    start=0.0, end=2.0, heading="步骤",
+                )
+            ]
+        }
+        client = FakeClient(
+            {
+                "checked_section_ids": ["sec001"],
+                "corrections": [
+                    {
+                        "section_id": "sec001", "paragraph_index": 0,
+                        "original": "选项", "replacement": "输入项",
+                        "replace_all": False, "occurrence": 1,
+                        "reason": "只修正第一次出现的位置",
+                    }
+                ],
+                "unresolved": [],
+            }
+        )
+        result = _proofread_asr_residue(sections, units, paragraphs, client, "教程")
+        self.assertEqual(paragraphs["sec001"][0].text, "输入项用于输入，另一个选项用于输出。")
+        self.assertEqual(result["corrections"][0]["replaced_count"], 1)
+
+    def test_create_manuscript_uses_final_adjudication_after_repair_limit(self):
+        issue = {
+            "section_id": "sec001",
+            "kind": "presenter_voice",
+            "instruction": "删除来源中的生活化等待场景",
+        }
+        repair = audit_repair({"sec001": "repair"}, [issue])
+        client = SequenceClient(
+            [
+                {
+                    "units": [
+                        {
+                            "start_source_id": "s000001",
+                            "action": "keep",
+                            "kind": "example",
+                            "topic": "等待期间",
+                            "text": "任务运行时可以去食堂吃饭。",
+                            "details": [],
+                            "drop_reason": None,
+                        }
+                    ]
+                },
+                {"corrections": []},
+                {
+                    "sections": [
+                        {
+                            "start_unit_id": "u000001",
+                            "title": "执行与等待",
+                            "objective": "保留操作过程和等待场景",
+                            "format_hint": "prose",
+                        }
+                    ]
+                },
+                {
+                    "paragraphs": [
+                        {
+                            "start_unit_id": "u000001",
+                            "text": "任务运行期间，用户可以去食堂吃饭。",
+                        }
+                    ]
+                },
+                repair,
+                {
+                    "paragraphs": [
+                        {
+                            "start_unit_id": "u000001",
+                            "text": "任务运行期间，用户可以去食堂吃饭。",
+                        }
+                    ]
+                },
+                repair,
+                {
+                    "paragraphs": [
+                        {
+                            "start_unit_id": "u000001",
+                            "text": "任务运行期间，用户可以去食堂吃饭。",
+                        }
+                    ]
+                },
+                repair,
+                {
+                    "paragraphs": [
+                        {
+                            "start_unit_id": "u000001",
+                            "text": "任务运行期间，用户可以去食堂吃饭。",
+                        }
+                    ]
+                },
+                repair,
+                {
+                    "decisions": [
+                        {
+                            "issue_index": 0,
+                            "valid": False,
+                            "reason": "等待场景来自来源，不应因生活化而删除。",
+                        }
+                    ]
+                },
+            ]
+        )
+        paragraphs, coverage = create_manuscript(
+            [Segment("s000001", 0.0, 2.0, "任务运行时可以去食堂吃饭。")],
+            client,
+            context="论文教程",
+        )
+        self.assertEqual(paragraphs[0].text, "任务运行期间，用户可以去食堂吃饭。")
+        final_audit = coverage["audit_history"][-1]
+        self.assertEqual(final_audit["verdict"], "pass")
+        self.assertTrue(final_audit["accepted_after_adjudication"])
+        self.assertEqual(final_audit["final_issue_adjudication"]["valid_issue_indices"], [])
+
+    def test_overbroad_information_unit_is_returned_to_model_for_semantic_split(self):
+        segments = [
+            Segment(f"s{index:06d}", (index - 1) * 6.0, index * 6.0, f"第{index}项内容")
+            for index in range(1, 7)
+        ]
+        client = SequenceClient(
+            [
+                {
+                    "units": [
+                        {
+                            "start_source_id": "s000001",
+                            "action": "keep",
+                            "kind": "other",
+                            "topic": "全部内容",
+                            "text": "六项内容。",
+                            "details": ["六项内容"],
+                            "drop_reason": None,
+                        }
+                    ]
+                },
+                {
+                    "units": [
+                        {
+                            "start_source_id": "s000001",
+                            "action": "keep",
+                            "kind": "step",
+                            "topic": "前三项",
+                            "text": "前三项内容。",
+                            "details": ["第一项", "第二项", "第三项"],
+                            "drop_reason": None,
+                        },
+                        {
+                            "start_source_id": "s000004",
+                            "action": "keep",
+                            "kind": "step",
+                            "topic": "后三项",
+                            "text": "后三项内容。",
+                            "details": ["第四项", "第五项", "第六项"],
+                            "drop_reason": None,
+                        },
+                    ]
+                },
+            ]
+        )
+        units = _extract_units(segments, client, "操作教程")
+        self.assertEqual(len(units), 2)
+        self.assertEqual(units[0].source_ids, ["s000001", "s000002", "s000003"])
+        self.assertEqual(units[1].source_ids, ["s000004", "s000005", "s000006"])
+
+    def test_publication_copyedit_runs_before_final_audit(self):
+        client = SequenceClient(
+            [
+                {
+                    "units": [
+                        {
+                            "start_source_id": "s000001",
+                            "action": "keep",
+                            "kind": "conclusion",
+                            "topic": "结果",
+                            "text": "作者认为流程简单。",
+                            "details": ["作者的主观评价"],
+                            "drop_reason": None,
+                        }
+                    ]
+                },
+                {"corrections": []},
+                {
+                    "sections": [
+                        {
+                            "start_unit_id": "u000001",
+                            "title": "流程结果",
+                            "objective": "说明作者结论",
+                            "format_hint": "prose",
+                        }
+                    ]
+                },
+                {
+                    "paragraphs": [
+                        {"start_unit_id": "u000001", "text": "总结：流程非常简单。"}
+                    ]
+                },
+                {
+                    "paragraphs": [
+                        {
+                            "start_unit_id": "u000001",
+                            "text": "作者认为，这一流程较为简、单。",
+                        }
+                    ]
+                },
+                {
+                    "checked_section_ids": ["sec001"],
+                    "corrections": [
+                        {
+                            "section_id": "sec001",
+                            "paragraph_index": 0,
+                            "original": "较为简、单",
+                            "replacement": "较为简单",
+                            "reason": "修复 ASR 错误断词",
+                        }
+                    ],
+                    "unresolved": [],
+                },
+                {
+                    **audit_pass("sec001"),
+                },
+                {
+                    "checked_section_ids": ["sec001"],
+                    "corrections": [],
+                    "unresolved": [],
+                },
+            ]
+        )
+        paragraphs, coverage = create_manuscript(
+            [Segment("s000001", 0.0, 2.0, "作者认为这个流程非常简单。")],
+            client,
+            context="操作教程",
+            publication_copyedit=True,
+        )
+        self.assertEqual(paragraphs[0].text, "作者认为，这一流程较为简单。")
+        self.assertEqual(coverage["audit_history"][0]["verdict"], "pass")
+
+    def test_asr_residue_is_rechecked_after_audit_driven_rewrite(self):
+        issue = {
+            "section_id": "sec001",
+            "unit_ids": ["u000001"],
+            "kind": "structure",
+            "instruction": "保留动作并改成自然段",
+        }
+        client = SequenceClient(
+            [
+                {
+                    "units": [
+                        {
+                            "start_source_id": "s000001",
+                            "action": "keep",
+                            "kind": "step",
+                            "topic": "复制内容",
+                            "text": "复制串软络并粘贴。",
+                            "details": ["复制并粘贴"],
+                            "drop_reason": None,
+                        }
+                    ]
+                },
+                {"corrections": []},
+                {
+                    "sections": [
+                        {
+                            "start_unit_id": "u000001",
+                            "title": "复制内容",
+                            "objective": "说明复制步骤",
+                            "format_hint": "prose",
+                        }
+                    ]
+                },
+                {"paragraphs": [{"start_unit_id": "u000001", "text": "复制相应内容并粘贴。"}]},
+                {"paragraphs": [{"start_unit_id": "u000001", "text": "复制相应内容并粘贴。"}]},
+                {"checked_section_ids": ["sec001"], "corrections": [], "unresolved": []},
+                audit_repair({"sec001": "repair"}, [issue]),
+                {"paragraphs": [{"start_unit_id": "u000001", "text": "复制串软络并粘贴。"}]},
+                {
+                    "checked_section_ids": ["sec001"],
+                    "corrections": [
+                        {
+                            "section_id": "sec001",
+                            "paragraph_index": 0,
+                            "original": "复制串软络",
+                            "replacement": "复制相应内容",
+                            "reason": "保留动作并移除无法恢复的乱码宾语",
+                        }
+                    ],
+                    "unresolved": [],
+                },
+                audit_pass("sec001"),
+                {"checked_section_ids": ["sec001"], "corrections": [], "unresolved": []},
+            ]
+        )
+        paragraphs, coverage = create_manuscript(
+            [Segment("s000001", 0.0, 2.0, "复制串软络并粘贴。")],
+            client,
+            context="操作教程",
+            publication_copyedit=True,
+        )
+        self.assertEqual(paragraphs[0].text, "复制相应内容并粘贴。")
+        self.assertEqual(len(coverage["audit_history"]), 2)
+        self.assertEqual(
+            coverage["repair_asr_residue_history"][0]["corrections"][0]["original"],
+            "复制串软络",
+        )
+
+    def test_skill_contract_documents_runtime_repair_and_record_delete_rules(self):
+        skill = Path(__file__).resolve().parents[2] / "SKILL.md"
+        text = skill.read_text(encoding="utf-8")
+        self.assertIn("four whole-document DeepSeek editorial passes", text)
+        self.assertIn("bounded DeepSeek reconciliation", text)
+        self.assertIn("complete timed transcript", text)
+        self.assertIn("complete timed transcript plus the complete first draft", text)
+        self.assertIn("DeepSeek, not Python, decides semantic importance", text)
+        self.assertIn("record-only soft deletions", text)
+        self.assertIn("Every source subtitle is assigned exactly once", text)
+        self.assertIn("start_source_id", text)
+        self.assertIn("entry path, exact button/option names", text)
+        self.assertIn("[6/6 · FAILED]", text)
+
+    def test_skill_requires_detached_submit_and_single_bulk_delete_operation(self):
+        skill = Path(__file__).resolve().parents[2] / "SKILL.md"
+        text = skill.read_text(encoding="utf-8")
+        self.assertIn("scripts/vtm submit", text)
+        self.assertIn("chat and task-management commands remain available", text)
+        self.assertIn("scripts/vtm delete-many --all-history", text)
+        self.assertIn("scripts/vtm delete-many --confirm-token", text)
+        self.assertNotIn("terminal(background=true, notify_on_complete=false)", text)
+
+    def test_launcher_skips_funasr_import_for_management_commands(self):
+        launcher = Path(__file__).resolve().parents[1] / "vtm"
+        text = launcher.read_text(encoding="utf-8")
+        self.assertIn("run|prepare-asr", text)
+        self.assertIn('if [ "$needs_asr_runtime" = false ]', text)
+
+    def test_progress_is_labelled_for_concurrent_jobs(self):
+        label = progress_label(2, "20260716-2")
+        self.assertEqual(label, "今日任务 2 · 20260716-2")
+        self.assertEqual(
+            format_progress(label, "正在获取或识别字幕。"),
+            "[今日任务 2 · 20260716-2] [2/6] 正在获取或识别字幕。",
+        )
+
+    def test_information_units_remove_filler_without_losing_meaningful_details(self):
+        segments = [
+            Segment("s000001", 0, 1, "嗯啊，然后我们开始。"),
+            Segment("s000002", 1, 3, "打开 Codex，选择允许访问项目目录。"),
+            Segment("s000003", 3, 5, "输入研究主题，等待 10 分钟生成文献列表。"),
+        ]
+        client = SequenceClient([
+            {"units": [
+                {"start_source_id": "s000001", "action": "drop", "kind": "other", "topic": "", "text": "", "details": [], "drop_reason": "filler"},
+                {"start_source_id": "s000002", "action": "keep", "kind": "step", "topic": "配置 Codex", "text": "打开 Codex 并允许访问项目目录，输入研究主题后等待 10 分钟生成文献列表。", "details": ["允许访问项目目录", "等待 10 分钟"], "drop_reason": None},
+            ]},
+            {"corrections": []},
+            {"sections": [{"start_unit_id": "u000002", "title": "配置 Codex 并生成文献列表", "objective": "保留完整操作", "format_hint": "steps"}]},
+            {"paragraphs": [{"start_unit_id": "u000002", "text": "在 Codex 中允许访问项目目录，输入研究主题后等待 10 分钟，系统会生成文献列表。"}]},
+            audit_pass("sec001"),
+        ])
+        paragraphs, coverage = create_manuscript(segments, client, context="研究论文教程")
+        self.assertEqual(paragraphs[0].source_ids, ["s000002", "s000003"])
+        self.assertNotIn("嗯啊", paragraphs[0].text)
+        self.assertIn("10 分钟", paragraphs[0].text)
+        self.assertEqual(coverage["dropped_unit_count"], 1)
+        self.assertEqual(coverage["editing_architecture"], "information_units_outline_sections_audit")
+
+    def test_information_unit_anchor_gate_ignores_open_and_unknown_sr(self):
+        anchors = manuscript_anchors("open the file，SR 只是识别噪声，但 Codex 和 10 分钟必须保留。")
+        self.assertNotIn("open", anchors)
+        self.assertNotIn("SR", anchors)
+        self.assertIn("Codex", anchors)
+        self.assertIn("10 分钟", anchors)
+
+    def test_chinese_and_arabic_quantities_are_equivalent_without_relaxing_gate(self):
+        evidence = "需要二十条文献，其中十五条中文、五条英文，消耗不到百分之十。"
+        self.assertTrue(manuscript_anchor_supported(evidence, "20条"))
+        self.assertTrue(manuscript_anchor_supported(evidence, "15条"))
+        self.assertTrue(manuscript_anchor_supported(evidence, "5条"))
+        self.assertTrue(manuscript_anchor_supported(evidence, "10%"))
+        self.assertFalse(manuscript_anchor_supported(evidence, "30条"))
+
+    def test_video_title_can_support_corrected_technical_name(self):
+        segments = [Segment("s000001", 0, 2, "使用Goodex生成论文大纲。")]
+        client = SequenceClient([
+            {"units": [{"start_source_id": "s000001", "action": "keep", "kind": "step", "topic": "生成大纲", "text": "使用Codex生成论文大纲。", "details": [], "drop_reason": None}]},
+            {"corrections": []},
+            {"sections": [{"start_unit_id": "u000001", "title": "使用Codex生成论文大纲", "objective": "说明操作", "format_hint": "prose"}]},
+            {"paragraphs": [{"start_unit_id": "u000001", "text": "使用 Codex 生成论文大纲。"}]},
+            audit_pass("sec001"),
+        ])
+        paragraphs, _coverage = create_manuscript(segments, client, context="标题：Codex论文教程")
+        self.assertIn("Codex", paragraphs[0].text)
+
+    def test_global_audit_repairs_only_the_failed_section(self):
+        segments = [
+            Segment("s000001", 0, 2, "先设置项目权限。"),
+            Segment("s000002", 2, 4, "再生成论文大纲。"),
+        ]
+        client = SequenceClient([
+            {"units": [
+                {"start_source_id": "s000001", "action": "keep", "kind": "step", "topic": "权限", "text": "设置项目权限。", "details": [], "drop_reason": None},
+                {"start_source_id": "s000002", "action": "keep", "kind": "step", "topic": "大纲", "text": "生成论文大纲。", "details": [], "drop_reason": None},
+            ]},
+            {"corrections": []},
+            {"sections": [
+                {"start_unit_id": "u000001", "title": "设置项目权限", "objective": "说明权限", "format_hint": "prose"},
+                {"start_unit_id": "u000002", "title": "生成论文大纲", "objective": "说明大纲", "format_hint": "prose"},
+            ]},
+            {"paragraphs": [{"start_unit_id": "u000001", "text": "先完成项目权限设置。"}]},
+            {"paragraphs": [{"start_unit_id": "u000002", "text": "随后处理论文。"}]},
+            audit_repair(
+                {"sec001": "pass", "sec002": "repair"},
+                [{"section_id": "sec002", "unit_ids": ["u000002"], "kind": "missing", "instruction": "补回生成论文大纲"}],
+            ),
+            {"paragraphs": [{"start_unit_id": "u000002", "text": "权限设置完成后，生成论文大纲。"}]},
+            audit_pass("sec001", "sec002"),
+        ])
+        paragraphs, coverage = create_manuscript(segments, client, context="论文教程")
+        self.assertEqual(client.calls, 8)
+        self.assertEqual(paragraphs[0].text, "先完成项目权限设置。")
+        self.assertIn("论文大纲", paragraphs[1].text)
+        self.assertEqual(len(coverage["audit_history"]), 2)
+        label = progress_label(2, "20260716-2")
+        completion = format_gateway_completion(
+            label,
+            {
+                "id": 2,
+                "note": "/vault/note.md",
+                "status": "complete",
+                "transcript_source": "funasr_paraformer",
+                "frames": 3,
+            },
+        )
+        self.assertIn("[6/6]", completion)
+        self.assertIn("处理完成", completion)
+        self.assertIn("funasr_paraformer", completion)
+        self.assertIn("保留画面：3", completion)
+        self.assertIn("已暂存服务器", completion)
+        self.assertIn("下载 2", completion)
+
+    def test_targeted_audit_repair_is_persisted_to_checkpoint(self):
+        segments = [
+            Segment("s000001", 0, 2, "设置项目权限。"),
+            Segment("s000002", 2, 4, "生成论文大纲。"),
+        ]
+        client = SequenceClient([
+            {"units": [
+                {"start_source_id": "s000001", "action": "keep", "kind": "step", "topic": "权限", "text": "设置项目权限。", "details": [], "drop_reason": None},
+                {"start_source_id": "s000002", "action": "keep", "kind": "step", "topic": "大纲", "text": "生成论文大纲。", "details": [], "drop_reason": None},
+            ]},
+            {"corrections": []},
+            {"sections": [
+                {"start_unit_id": "u000001", "title": "设置项目权限", "objective": "说明权限", "format_hint": "prose"},
+                {"start_unit_id": "u000002", "title": "生成论文大纲", "objective": "说明大纲", "format_hint": "prose"},
+            ]},
+            {"paragraphs": [{"start_unit_id": "u000001", "text": "设置项目权限。"}]},
+            {"paragraphs": [{"start_unit_id": "u000002", "text": "处理论文内容。"}]},
+            audit_repair(
+                {"sec001": "pass", "sec002": "repair"},
+                [{"section_id": "sec002", "unit_ids": ["u000002"], "kind": "missing", "instruction": "补回论文大纲"}],
+            ),
+            {"paragraphs": [{"start_unit_id": "u000002", "text": "生成论文大纲。"}]},
+            audit_pass("sec001", "sec002"),
+        ])
+        with tempfile.TemporaryDirectory() as temp:
+            checkpoint = Path(temp) / "checkpoint.json"
+            create_manuscript(segments, client, context="论文教程", checkpoint_path=checkpoint)
+            saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+        self.assertEqual(saved["sections"]["sec002"][0]["text"], "生成论文大纲。")
+        self.assertTrue(saved["completed"])
+
+    def test_global_terminology_pass_repairs_a_context_supported_asr_name(self):
+        segments = [Segment("s000001", 0, 2, "指令放在五幺SCI点top。")]
+        client = SequenceClient([
+            {"units": [{"start_source_id": "s000001", "action": "keep", "kind": "step", "topic": "领取指令", "text": "指令放在五幺SCI点top。", "details": [], "drop_reason": None}]},
+            {"corrections": []},
+            {"sections": [{"start_unit_id": "u000001", "title": "领取配套指令", "objective": "说明领取位置", "format_hint": "prose"}]},
+            {"paragraphs": [{"start_unit_id": "u000001", "text": "配套指令放在 51SCI.top。"}]},
+            audit_pass("sec001"),
+        ])
+        paragraphs, coverage = create_manuscript(segments, client, context="学术写作教程")
+        self.assertIn("51SCI.top", paragraphs[0].text)
+        self.assertEqual(coverage["terminology_corrections"][0]["original"], "五幺SCI点top")
+
+    def test_global_terminology_pass_unifies_cross_unit_entity_variants(self):
+        segments = [
+            Segment("s000001", 0, 2, "打开SY Paper输入选题。"),
+            Segment("s000002", 2, 4, "把参考文献粘贴到SR pick。"),
+        ]
+        client = SequenceClient([
+            {"units": [
+                {"start_source_id": "s000001", "action": "keep", "kind": "step", "topic": "输入选题", "text": "打开SY Paper输入选题。", "details": [], "drop_reason": None},
+                {"start_source_id": "s000002", "action": "keep", "kind": "step", "topic": "粘贴文献", "text": "把参考文献粘贴到SR pick。", "details": [], "drop_reason": None},
+            ]},
+            {"corrections": [
+                {"unit_id": "u000002", "original": "SR pick", "replacement": "SY Paper", "confidence": "high", "reason": "同一工作流前文给出完整平台名"},
+            ]},
+            {"sections": [{"start_unit_id": "u000001", "title": "在SY Paper中输入选题并上传文献", "objective": "说明连续操作", "format_hint": "steps"}]},
+            {"paragraphs": [{"start_unit_id": "u000001", "text": "在 SY Paper 中输入选题，再将参考文献粘贴到 SY Paper。"}]},
+            audit_pass("sec001"),
+        ])
+        paragraphs, coverage = create_manuscript(segments, client, context="学术写作平台教程")
+        self.assertNotIn("SR pick", paragraphs[0].text)
+        self.assertEqual(coverage["terminology_corrections"][0]["replacement"], "SY Paper")
+
+    def test_transcript_style_paragraph_opening_is_removed_deterministically(self):
+        segments = [Segment("s000001", 0, 2, "接下来生成论文大纲。")]
+        client = SequenceClient([
+            {"units": [{"start_source_id": "s000001", "action": "keep", "kind": "step", "topic": "论文大纲", "text": "生成论文大纲。", "details": [], "drop_reason": None}]},
+            {"corrections": []},
+            {"sections": [{"start_unit_id": "u000001", "title": "生成论文大纲", "objective": "说明生成动作", "format_hint": "prose"}]},
+            {"paragraphs": [{"start_unit_id": "u000001", "text": "然后生成论文大纲。"}]},
+            audit_pass("sec001"),
+        ])
+        paragraphs, _coverage = create_manuscript(segments, client, context="论文教程")
+        self.assertEqual(client.calls, 5)
+        self.assertFalse(paragraphs[0].text.startswith("然后"))
+        self.assertEqual(paragraphs[0].text, "生成论文大纲。")
+
+    def test_failed_terminology_batch_is_atomic(self):
+        segments = [Segment("s000001", 0, 2, "产品甲用于生成大纲。")]
+        client = SequenceClient([
+            {"units": [{"start_source_id": "s000001", "action": "keep", "kind": "step", "topic": "生成大纲", "text": "产品甲用于生成大纲。", "details": [], "drop_reason": None}]},
+            {"corrections": [
+                {"unit_id": "u000001", "original": "产品甲", "replacement": "产品乙", "confidence": "high", "reason": "测试"},
+                {"unit_id": "invented", "original": "大纲", "replacement": "提纲", "confidence": "high", "reason": "测试"},
+            ]},
+            {"corrections": []},
+            {"sections": [{"start_unit_id": "u000001", "title": "生成论文大纲", "objective": "说明用途", "format_hint": "prose"}]},
+            {"paragraphs": [{"start_unit_id": "u000001", "text": "产品甲用于生成论文大纲。"}]},
+            audit_pass("sec001"),
+        ])
+        paragraphs, coverage = create_manuscript(segments, client, context="教程")
+        self.assertIn("产品甲", paragraphs[0].text)
+        self.assertNotIn("产品乙", paragraphs[0].text)
+        self.assertEqual(coverage["terminology_corrections"], [])
+
+    def test_contextual_normalization_repairs_known_alias_and_malformed_phrases(self):
+        source = "Credex配合自带超期一篇文献的平台，生成真实参考文献和三大纲的论文初稿。"
+        segments = [Segment("s000001", 0, 2, source)]
+        client = SequenceClient([
+            {"units": [{"start_source_id": "s000001", "action": "keep", "kind": "explanation", "topic": "平台能力", "text": source, "details": [], "drop_reason": None}]},
+            {"corrections": []},
+            {"sections": [{"start_unit_id": "u000001", "title": "平台能力与初稿生成", "objective": "说明平台能力", "format_hint": "prose"}]},
+            {"paragraphs": [{"start_unit_id": "u000001", "text": "Codex 配合自带大量文献的平台，生成依托真实参考文献和大纲生成的论文初稿。"}]},
+            audit_pass("sec001"),
+        ])
+        paragraphs, coverage = create_manuscript(segments, client, context="标题：Codex论文教程")
+        self.assertIn("Codex", paragraphs[0].text)
+        self.assertIn("自带大量文献", paragraphs[0].text)
+        self.assertNotIn("三大纲", paragraphs[0].text)
+        self.assertGreaterEqual(len(coverage["terminology_corrections"]), 3)
+
+    def test_outline_rejects_over_fragmentation_and_retries(self):
+        units = [
+            InformationUnit(
+                id=f"u{index:06d}", source_ids=[f"s{index:06d}"], start=index,
+                end=index + 1, action="keep", kind="step", topic=f"步骤{index}",
+                text=f"完成步骤{index}。",
+            )
+            for index in range(1, 14)
+        ]
+        client = SequenceClient([
+            {"sections": [
+                {"start_unit_id": "u000001", "title": "准备项目环境", "objective": "准备", "format_hint": "steps"},
+                {"start_unit_id": "u000004", "title": "搜索参考文献", "objective": "搜索", "format_hint": "steps"},
+                {"start_unit_id": "u000007", "title": "生成论文大纲", "objective": "大纲", "format_hint": "steps"},
+                {"start_unit_id": "u000010", "title": "生成论文初稿", "objective": "初稿", "format_hint": "steps"},
+            ]},
+            {"sections": [
+                {"start_unit_id": "u000001", "title": "准备项目并搜索文献", "objective": "准备和搜索", "format_hint": "steps"},
+                {"start_unit_id": "u000006", "title": "生成并核对论文大纲", "objective": "大纲", "format_hint": "steps"},
+                {"start_unit_id": "u000010", "title": "生成论文初稿", "objective": "初稿", "format_hint": "steps"},
+            ]},
+        ])
+        sections = _plan_outline(units, client, "论文教程")
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(len(sections), 3)
+
+    def test_presenter_style_audience_language_is_rewritten(self):
+        segments = [Segment("s000001", 0, 2, "今天手把手教同学们使用Codex。")]
+        client = SequenceClient([
+            {"units": [{"start_source_id": "s000001", "action": "keep", "kind": "claim", "topic": "教程目标", "text": "视频将演示如何使用Codex。", "details": [], "drop_reason": None}]},
+            {"corrections": []},
+            {"sections": [{"start_unit_id": "u000001", "title": "教程目标", "objective": "说明教程目标", "format_hint": "prose"}]},
+            {"paragraphs": [{"start_unit_id": "u000001", "text": "今天手把手教同学们使用 Codex。"}]},
+            audit_pass("sec001"),
+        ])
+        paragraphs, _coverage = create_manuscript(segments, client, context="Codex教程")
+        self.assertEqual(paragraphs[0].text, "视频演示如何使用 Codex。")
+
+    def test_malformed_global_audit_json_is_retried(self):
+        responses = manuscript_responses("完整内容。")
+        responses[-1:] = ["{\"verdict\":\"pass\"", audit_pass("sec001")]
+        client = RawSequenceClient(responses)
+        paragraphs, coverage = create_manuscript(
+            [Segment("s000001", 0, 2, "完整内容。")], client, context="测试"
+        )
+        self.assertEqual(paragraphs[0].text, "完整内容。")
+        self.assertEqual(client.calls, 6)
+        self.assertEqual(coverage["audit_history"][0]["verdict"], "pass")
+
+    def test_audit_without_per_section_reviews_is_retried(self):
+        responses = manuscript_responses("完整内容。")
+        responses[-1:] = [
+            {"verdict": "pass", "issues": []},
+            audit_pass("sec001"),
+        ]
+        client = SequenceClient(responses)
+        _paragraphs, coverage = create_manuscript(
+            [Segment("s000001", 0, 2, "完整内容。")], client, context="测试"
+        )
+        self.assertEqual(client.calls, 6)
+        self.assertEqual(
+            coverage["audit_history"][0]["section_reviews"][0]["section_id"],
+            "sec001",
+        )
+
+    def test_deterministic_editorial_diagnostics_detect_presenter_voice(self):
+        sections = [
+            type("Section", (), {"id": "sec001"})(),
+        ]
+        paragraphs = {
+            "sec001": [Paragraph(["s000001"], "同学们，大家可以点击设置。")]
+        }
+        report = manuscript_quality_report(sections, paragraphs)
+        self.assertEqual(report["status"], "fail")
+        self.assertIn("presenter_voice", report["blockers"])
+
+    def test_evaluate_reuses_raw_transcript_without_task_or_vault_write(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source"
+            source.mkdir()
+            (source / "metadata.json").write_text(
+                json.dumps({"title": "测试视频", "owner": "测试作者"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (source / "raw-transcript.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {"source": "fixture"},
+                        "segments": [
+                            {"id": "s000001", "start": 0, "end": 2, "text": "完整内容。"}
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            client = SequenceClient(
+                direct_manuscript_responses("完整内容。")
+            )
+            with patch("video_manuscript.text_client", return_value=client), patch.dict(
+                os.environ, {"VTM_STATE_DIR": str(root / "state")}
+            ):
+                result = evaluate_text_core(source)
+            self.assertFalse(result["task_reserved"])
+            self.assertFalse(result["vault_written"])
+            self.assertTrue(Path(str(result["preview"])).is_file())
+            self.assertFalse((root / "state" / "tasks.sqlite3").exists())
+
+    def test_resume_copies_matching_semantic_checkpoint_for_signature_validation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            resume = Path(temp) / "old"
+            target = Path(temp) / "new" / "manuscript-checkpoint.json"
+            resume.mkdir()
+            target.parent.mkdir()
+            source = resume / "manuscript-checkpoint.json"
+            source.write_text('{"signature":"abc"}', encoding="utf-8")
+            _resume_checkpoint(resume, target)
+            self.assertEqual(target.read_text(encoding="utf-8"), '{"signature":"abc"}')
+
+    def test_gateway_reporter_emits_and_delivers_each_line_once(self):
+        delivered = []
+        reporter = GatewayProgressReporter(
+            "今日任务 8 · 20260716-8",
+            target="feishu",
+            sender=lambda target, message: delivered.append((target, message)),
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            reporter.progress("正在读取视频信息。")
+            reporter.progress("处理完成。")
+            reporter.completion(
+                {
+                    "id": 8,
+                    "note": "/vault/demo.md",
+                    "status": "complete",
+                    "transcript_source": "native",
+                    "frames": 1,
+                }
+            )
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("[1/6]", lines[0])
+        self.assertIn("[6/6]", lines[1])
+        self.assertEqual(delivered, [("feishu", lines[0]), ("feishu", lines[1])])
+
+    def test_progress_delivery_failure_does_not_abort_video_job(self):
+        def broken_sender(_target, _message):
+            raise RuntimeError("offline")
+
+        reporter = GatewayProgressReporter(
+            "今日任务 9 · 20260716-9", target="feishu", sender=broken_sender
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            reporter.progress("正在读取视频信息。")
+        self.assertIn("[1/6]", output.getvalue())
+        self.assertEqual(len(reporter.delivery_errors), 1)
+
+    def test_failure_notification_is_an_explicit_terminal_stage(self):
+        delivered = []
+        reporter = GatewayProgressReporter(
+            "今日任务 8 · 20260716-8",
+            target="feishu",
+            sender=lambda target, message: delivered.append(message),
+        )
+        with contextlib.redirect_stderr(io.StringIO()):
+            reporter.terminal("FAILED", "任务已结束，未生成笔记。")
+        self.assertEqual(len(delivered), 1)
+        self.assertIn("[6/6 · FAILED]", delivered[0])
+        self.assertIn("任务已结束", delivered[0])
+
+    def test_preflight_failure_is_sent_to_gateway_without_a_task_number(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"VTM_STATE_DIR": str(Path(temp) / "state")}
+        ), patch.object(
+            sys,
+            "argv",
+            [
+                "video_manuscript.py",
+                "run",
+                "--url",
+                "BV1ab411c7DE",
+                "--vault",
+                str(Path(temp) / "vault"),
+                "--max-frames",
+                "121",
+                "--gateway-output",
+                "--progress-target",
+                "feishu",
+            ],
+        ), patch("video_manuscript.load_runtime_env"), patch(
+            "video_manuscript.duplicate_skill_paths", return_value=[]
+        ), patch("video_manuscript.send_hermes_progress") as sender, contextlib.redirect_stderr(
+            io.StringIO()
+        ):
+            self.assertEqual(main(), 1)
+        sender.assert_called_once()
+        self.assertIn("[6/6 · FAILED]", sender.call_args.args[1])
+        self.assertIn("未生成笔记", sender.call_args.args[1])
+
+    def test_bundle_contains_markdown_and_assets_but_not_source_by_default(self):
+        with tempfile.TemporaryDirectory() as temp:
+            vault = Path(temp)
+            state = vault / "state"
+            job = vault / "Sources" / "Videos" / "2026" / "2026-07" / "demo [BV11JNn6mESN-p1]"
+            (job / "assets").mkdir(parents=True)
+            (job / "demo.md").write_text("![frame](assets/001.png)", encoding="utf-8")
+            (job / "assets" / "001.png").write_bytes(b"png")
+            with patch.dict(os.environ, {"VTM_STATE_DIR": str(state)}):
+                task = reserve_task(vault, url="u", bvid="BV11JNn6mESN")
+                update_task(vault, task["task_key"], status="complete", job_dir=str(job), note=str(job / "demo.md"))
+                result = bundle_job(vault, task_id=task["task_key"])
+            archive = Path(str(result["bundle"]))
+            with zipfile.ZipFile(archive) as handle:
+                names = handle.namelist()
+            self.assertTrue(any(name.endswith("demo.md") for name in names))
+            self.assertTrue(any(name.endswith("assets/") for name in names))
+            self.assertTrue(any(name.endswith("assets/001.png") for name in names))
+            self.assertFalse(any("/source/" in name for name in names))
+
+    def test_bundle_refuses_a_registered_directory_outside_the_vault(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            vault = root / "vault"
+            outside = root / "outside"
+            outside.mkdir()
+            note = outside / "note.md"
+            note.write_text("正文", encoding="utf-8")
+            with patch.dict(os.environ, {"VTM_STATE_DIR": str(root / "state")}):
+                task = reserve_task(vault, url="u", bvid="BV1outside")
+                update_task(
+                    vault,
+                    task["task_key"],
+                    status="complete",
+                    job_dir=str(outside),
+                    note=str(note),
+                )
+                with self.assertRaisesRegex(FileNotFoundError, "记录不一致"):
+                    bundle_job(vault, task_id=task["task_key"])
+
+    def test_bundle_refuses_symlinked_assets_and_audit_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            vault = root / "vault"
+            state = root / "state"
+            job = vault / "Sources" / "Videos" / "2026" / "2026-07" / "demo"
+            assets = job / "assets"
+            assets.mkdir(parents=True)
+            note = job / "demo.md"
+            note.write_text("正文", encoding="utf-8")
+            outside = root / "outside.txt"
+            outside.write_text("不能进入压缩包", encoding="utf-8")
+            (assets / "linked.png").symlink_to(outside)
+            with patch.dict(os.environ, {"VTM_STATE_DIR": str(state)}):
+                task = reserve_task(vault, url="u", bvid="BV1symlink")
+                update_task(
+                    vault,
+                    task["task_key"],
+                    status="complete",
+                    job_dir=str(job),
+                    note=str(note),
+                )
+                with self.assertRaisesRegex(RuntimeError, "符号链接"):
+                    bundle_job(vault, task_id=task["task_key"])
+
+                (assets / "linked.png").unlink()
+                audit = state / "tasks" / str(task["task_key"])
+                audit.mkdir(parents=True, exist_ok=True)
+                (audit / "linked.json").symlink_to(outside)
+                with self.assertRaisesRegex(RuntimeError, "符号链接"):
+                    bundle_job(vault, task_id=task["task_key"], include_source=True)
+
+    def test_download_sender_uses_media_document_protocol_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            archive = Path(temp) / "note.zip"
+            archive.write_bytes(b"zip")
+            completed = type("Completed", (), {"returncode": 0, "stderr": ""})()
+            with patch("video_manuscript._hermes_binary", return_value="/bin/hermes"), patch(
+                "video_manuscript.subprocess.run", return_value=completed
+            ) as runner:
+                send_hermes_document("feishu", archive)
+            runner.assert_called_once()
+            argv = runner.call_args.args[0]
+            self.assertEqual(argv[:5], ["/bin/hermes", "send", "--to", "feishu", "--quiet"])
+            self.assertEqual(argv[5], f"[[as_document]] MEDIA:{archive.resolve()}")
+
+    def test_needs_review_draft_is_not_downloadable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            vault = Path(temp)
+            state = vault / "state"
+            job = vault / "Sources" / "Videos" / "draft"
+            job.mkdir(parents=True)
+            note = job / "draft.md"
+            note.write_text("未通过的草稿", encoding="utf-8")
+            with patch.dict(os.environ, {"VTM_STATE_DIR": str(state)}):
+                task = reserve_task(vault, url="u", bvid="BV1review")
+                update_task(vault, task["task_key"], status="needs_review", job_dir=str(job), note=str(note))
+                with self.assertRaisesRegex(RuntimeError, "不可下载"):
+                    bundle_job(vault, task_id=task["task_key"])
+
+    def test_existing_jobs_get_persistent_numbers_and_download_by_task(self):
+        with tempfile.TemporaryDirectory() as temp:
+            vault = Path(temp)
+            state = vault / "state"
+            job = vault / "Sources" / "Videos" / "2026" / "2026-07" / "demo [BV11JNn6mESN-p1]"
+            (job / "assets").mkdir(parents=True)
+            (job / "demo.md").write_text("正文", encoding="utf-8")
+            with patch.dict(os.environ, {"VTM_STATE_DIR": str(state)}):
+                task = reserve_task(vault, url="u", bvid="BV11JNn6mESN")
+                update_task(vault, task["task_key"], status="complete", job_dir=str(job), note=str(job / "demo.md"))
+                result = bundle_job(vault, task_id=1)
+                self.assertTrue(Path(str(result["bundle"])).is_file())
+                self.assertEqual(list_tasks(vault)[0]["bundle"], result["bundle"])
+
+    def test_reserved_task_is_not_duplicated_when_job_appears(self):
+        with tempfile.TemporaryDirectory() as temp:
+            vault = Path(temp)
+            with patch.dict(os.environ, {"VTM_STATE_DIR": str(vault / "state")}):
+                task = reserve_task(vault, url="u", bvid="BV11JNn6mESN")
+                update_task(vault, task["task_key"], status="complete")
+                self.assertEqual(len(list_tasks(vault)), 1)
+                self.assertRegex(task["task_key"], r"^\d{8}-1$")
+
+    def test_failed_video_blocks_blind_retry_and_preserves_first_task_number(self):
+        with tempfile.TemporaryDirectory() as temp:
+            vault = Path(temp)
+            with patch.dict(os.environ, {"VTM_STATE_DIR": str(vault / "state")}):
+                task = reserve_task(vault, url="u", bvid="BV1failed")
+                update_task(vault, task["task_key"], status="failed", error="ASR failed")
+                found = find_existing_video_task(vault, "BV1failed")
+                self.assertIsNotNone(found)
+                self.assertEqual(found["task_key"], task["task_key"])
+                self.assertEqual(len(list_tasks(vault)), 1)
+
+    def test_duplicate_detection_distinguishes_video_parts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            vault = Path(temp)
+            with patch.dict(os.environ, {"VTM_STATE_DIR": str(vault / "state")}):
+                task = reserve_task(vault, url="u", bvid="BV1parts", part=1)
+                update_task(vault, task["task_key"], status="complete")
+                self.assertIsNotNone(find_existing_video_task(vault, "BV1parts", 1))
+                self.assertIsNone(find_existing_video_task(vault, "BV1parts", 2))
+
+    def test_funasr_batch_is_bounded_for_reference_server(self):
+        self.assertEqual(FUNASR_BATCH_SECONDS, 60)
+
+    def test_current_server_json_registry_migrates_without_installing_v3_first(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"VTM_STATE_DIR": str(Path(temp) / "state")}
+        ):
+            vault = Path(temp) / "vault"
+            job = vault / "Video Notes" / "旧版笔记 [BV11JNn6mESN-p1]"
+            job.mkdir(parents=True)
+            note = job / "旧版笔记.md"
+            note.write_text("旧版正文", encoding="utf-8")
+            (vault / ".video-manuscript-tasks.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "tasks": [
+                            {
+                                "id": 1,
+                                "bvid": "BV11JNn6mESN",
+                                "title": "旧版笔记",
+                                "status": "complete",
+                                "created_at": "2026-07-15T21:28:00+00:00",
+                                "updated_at": "2026-07-15T21:57:32+00:00",
+                                "job_dir": str(job),
+                                "note": str(note),
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            migrated = list_tasks(vault, all_tasks=True)
+            self.assertEqual(len(migrated), 1)
+            self.assertEqual(migrated[0]["task_key"], "20260716-1")
+            self.assertEqual(Path(migrated[0]["note"]), note)
+
+    def test_runtime_env_loader_is_allowlisted_and_sets_default_vault(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            env_dir = home / ".hermes"
+            env_dir.mkdir()
+            (env_dir / ".env").write_text(
+                "DEEPSEEK_API_KEY='secret-value'\n"
+                "VTM_VAULT=/tmp/example-vault\n"
+                "VTM_FINAL_VISUAL_HEIGHT=1080\n"
+                "UNRELATED_SECRET=must-not-load\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {}, clear=True), patch(
+                "video_manuscript.Path.home", return_value=home
+            ):
+                load_runtime_env()
+                self.assertEqual(os.environ["DEEPSEEK_API_KEY"], "secret-value")
+                self.assertNotIn("UNRELATED_SECRET", os.environ)
+                self.assertEqual(default_vault(), Path("/tmp/example-vault"))
+                self.assertEqual(os.environ["VTM_FINAL_VISUAL_HEIGHT"], "1080")
+
+    def test_duplicate_skill_installations_are_detected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            first = home / ".hermes" / "skills" / "video-to-detailed-manuscript"
+            backup = home / ".hermes" / "skills" / "video-to-detailed-manuscript.pre-v4"
+            first.mkdir(parents=True)
+            backup.mkdir(parents=True)
+            manifest = "---\nname: video-to-detailed-manuscript\ndescription: test\n---\n"
+            (first / "SKILL.md").write_text(manifest, encoding="utf-8")
+            (backup / "SKILL.md").write_text(manifest, encoding="utf-8")
+            with patch("video_manuscript.Path.home", return_value=home):
+                paths = duplicate_skill_paths()
+            self.assertEqual(len(paths), 2)
+
+    def test_url_validation_and_bvid(self):
+        client = BilibiliClient(cookie="")
+        self.assertEqual(
+            client.extract_bvid("https://www.bilibili.com/video/BV1ab411c7DE?p=2"),
+            "BV1ab411c7DE",
+        )
+        client._validate_url("https://b23.tv/abc")
+        self.assertEqual(
+            client.normalize_input_url("BV1ab411c7DE"),
+            "https://www.bilibili.com/video/BV1ab411c7DE/",
+        )
+        self.assertEqual(
+            client.normalize_input_url("av123"),
+            "https://www.bilibili.com/video/av123/",
+        )
+        self.assertEqual(
+            client.extract_part("https://www.bilibili.com/video/BV1ab411c7DE?p=2"),
+            2,
+        )
+        with self.assertRaises(ValueError):
+            client._validate_url("https://bilibili.com.evil.example/video/BV1ab411c7DE")
+
+    def test_short_link_resolution_does_not_forward_login_cookie(self):
+        client = BilibiliClient(cookie="SESSDATA=private")
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def geturl(self):
+                return "https://www.bilibili.com/video/BV1ab411c7DE/"
+
+        with patch("vtm_core.bilibili.urllib.request.urlopen", return_value=Response()) as opener:
+            resolved = client.resolve("https://b23.tv/demo")
+        request = opener.call_args.args[0]
+        self.assertEqual(resolved, "https://www.bilibili.com/video/BV1ab411c7DE/")
+        self.assertNotIn("Cookie", request.headers)
+
+    def test_av_url_is_resolved_through_metadata(self):
+        client = BilibiliClient(cookie="")
+        requests = []
+        def fake_request(url, params=None):
+            requests.append(params or {})
+            return {
+            "code": 0,
+            "data": {
+                "bvid": "BV1ab411c7DE",
+                "title": "demo",
+                "cid": 42,
+                "duration": 10,
+                "pages": [{"cid": 42, "duration": 10, "part": "demo"}],
+            },
+        }
+        client._request = fake_request
+        info = client.inspect("av123")
+        self.assertEqual(info.bvid, "BV1ab411c7DE")
+        self.assertEqual(info.cid, 42)
+
+    def test_player_api_selects_audio_and_bounded_video(self):
+        info = VideoInfo(
+            url="https://www.bilibili.com/video/BV1ab411c7DE",
+            bvid="BV1ab411c7DE",
+            cid=42,
+            part=1,
+            title="demo",
+            part_title="demo",
+            duration=10,
+            owner="",
+            cover="",
+        )
+        client = BilibiliClient(cookie="")
+        requests = []
+        def fake_request(url, params=None):
+            requests.append(params or {})
+            return {
+                "code": 0,
+                "data": {
+                    "dash": {
+                        "audio": [
+                            {"id": 1, "bandwidth": 64000, "baseUrl": "https://a.bilivideo.com/a"},
+                            {"id": 2, "bandwidth": 128000, "baseUrl": "https://a.bilivideo.com/b"},
+                        ],
+                        "video": [
+                            {"id": 16, "height": 360, "bandwidth": 100, "baseUrl": "https://v.bilivideo.com/360"},
+                            {"id": 64, "height": 720, "bandwidth": 200, "baseUrl": "https://v.bilivideo.com/720"},
+                            {"id": 80, "height": 1080, "bandwidth": 300, "baseUrl": "https://v.bilivideo.com/1080"},
+                        ],
+                    }
+                },
+            }
+        client._request = fake_request
+        self.assertEqual(client.media_stream(info, audio_only=True)["quality"], 2)
+        video = client.media_stream(info, audio_only=False, max_height=720)
+        self.assertEqual(video["height"], 720)
+        self.assertEqual(requests[-1]["qn"], 64)
+        high = client.media_stream(info, audio_only=False, max_height=1080)
+        self.assertEqual(high["height"], 1080)
+        self.assertEqual(requests[-1]["qn"], 80)
+        with self.assertRaises(RuntimeError):
+            client._validate_media_url("https://bilivideo.com.evil.example/video.m4s")
+
+        client._request = lambda url, params=None: {
+            "code": 0,
+            "data": {
+                "dash": {
+                    "video": [
+                        {
+                            "id": 80,
+                            "height": 1080,
+                            "bandwidth": 300,
+                            "baseUrl": "https://v.bilivideo.com/1080",
+                        }
+                    ]
+                }
+            },
+        }
+        with self.assertRaisesRegex(RuntimeError, "within the requested height"):
+            client.media_stream(info, audio_only=False, max_height=720)
+
+    def test_cookie_ai_transcript_parses_timestamped_fragments(self):
+        info = VideoInfo(
+            url="https://www.bilibili.com/video/BV1ab411c7DE",
+            bvid="BV1ab411c7DE",
+            cid=42,
+            part=1,
+            title="demo",
+            part_title="demo",
+            duration=10,
+            owner="",
+            cover="",
+        )
+        client = BilibiliClient(cookie="SESSDATA=test")
+        client._wbi_keys = lambda: ("a" * 32, "b" * 32)
+        client._request = lambda url, params=None: {
+            "code": 0,
+            "data": {
+                "stid": "123",
+                "model_result": {
+                    "result_type": 2,
+                    "subtitle": [
+                        {
+                            "part_subtitle": [
+                                {
+                                    "content": "带时间的完整句子",
+                                    "start_timestamp": 1,
+                                    "end_timestamp": 3,
+                                }
+                            ]
+                        }
+                    ],
+                },
+            },
+        }
+        segments, metadata = client.ai_transcript(info)
+        self.assertEqual(segments[0].text, "带时间的完整句子")
+        self.assertEqual(segments[0].start, 1)
+        self.assertEqual(metadata["source"], "bilibili_ai_conclusion")
+
+    def test_parse_funasr_srt(self):
+        segments = parse_srt(
+            "1\n00:00:00,500 --> 00:00:02,000\n第一句话。\n\n"
+            "2\n00:00:02.100 --> 00:00:05.250\n第二句话，保留解释。\n"
+        )
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(segments[0].start, 0.5)
+        self.assertEqual(segments[1].end, 5.25)
+        self.assertIn("保留解释", segments[1].text)
+
+    def test_model_alias_survives_inaccessible_inherited_working_directory(self):
+        with patch("vtm_core.asr.Path.is_dir", side_effect=[PermissionError(), False]):
+            self.assertIsNone(faster_whisper_model_path("medium"))
+
+    def test_safe_name(self):
+        self.assertEqual(safe_name('bad:/name*?"'), "bad name")
+        self.assertEqual(safe_name("   "), "video")
+
+    def test_missing_text_model_refuses_to_publish_raw_asr(self):
+        segments = [
+            Segment("s000001", 0, 1, "嗯，第一点"),
+            Segment("s000002", 1, 2, "这是解释。"),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "拒绝发布"):
+            edit_transcript(segments, None)
+
+    def test_model_omission_blocks_publication(self):
+        segments = [
+            Segment("s000001", 0, 1, "第一点。"),
+            Segment("s000002", 1, 2, "重要的例子。"),
+        ]
+        client = FakeClient(
+            {
+                "paragraphs": [{"start_source_id": "s000001", "text": "第一点。"}],
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "质量门禁"):
+            edit_transcript(segments, client)
+
+    def test_model_cannot_delete_meaningful_segment_as_filler(self):
+        segments = [Segment("s000001", 0, 2, "这个限制条件非常重要。")]
+        client = FakeClient({"paragraphs": []})
+        with self.assertRaisesRegex(RuntimeError, "质量门禁"):
+            edit_transcript(segments, client)
+
+    def test_filler_words_may_be_omitted_but_source_id_stays_accounted(self):
+        segments = [
+            Segment("s000001", 0, 1, "好，OK，接下来我们来看一下。"),
+            Segment("s000002", 1, 3, "点击插件，然后允许浏览器连接网络。"),
+        ]
+        client = FakeClient({
+            "paragraphs": [{
+                "start_source_id": "s000001",
+                "text": "点击“插件”，然后允许浏览器连接网络。",
+                "heading": None,
+            }],
+        })
+        paragraphs, coverage = edit_transcript(segments, client)
+        self.assertEqual(coverage["quality_status"], "pass")
+        self.assertEqual(coverage["accounted_count"], 2)
+        self.assertIn("允许", paragraphs[0].text)
+
+    def test_batch_edit_gets_three_total_attempts(self):
+        segments = [Segment("s000001", 0, 3, "点击插件，然后允许浏览器连接网络。")]
+        invalid = {"paragraphs": []}
+        valid = {
+            "paragraphs": [
+                {
+                    "start_source_id": "s000001",
+                    "text": "点击插件，然后允许浏览器连接网络。",
+                    "heading": None,
+                }
+            ],
+        }
+        client = SequenceClient([invalid, invalid, valid])
+        paragraphs, coverage = edit_transcript(segments, client)
+        self.assertEqual(client.calls, BATCH_EDIT_MAX_ATTEMPTS + 1)
+        self.assertEqual(coverage["quality_status"], "pass")
+        self.assertEqual(len(paragraphs), 1)
+
+    def test_required_faithful_batch_fails_fast_with_its_own_error(self):
+        segments = [
+            Segment("s000001", 0, 2, "必须保留这一项具体操作。"),
+            Segment("s000002", 2, 4, "还必须保留检查方法。"),
+        ]
+        client = SequenceClient([{"paragraphs": []}])
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"失败分批：1；第 1 批忠实校订失败：",
+        ):
+            edit_transcript(segments, client)
+        self.assertEqual(client.calls, BATCH_EDIT_MAX_ATTEMPTS)
+
+    def test_oversized_faithful_draft_reaches_structure_refinement(self):
+        repeated = "必须完整保留这一项具体操作、参数、解释和检查方法。" * 9
+        segments = [
+            Segment(f"s{index:06d}", (index - 1) * 20, index * 20, repeated)
+            for index in range(1, 5)
+        ]
+        faithful = {
+            "paragraphs": [
+                {
+                    "start_source_id": "s000001",
+                    "text": "".join(segment.text for segment in segments),
+                    "heading": "完整操作",
+                }
+            ]
+        }
+        refined = {
+            "paragraphs": [
+                {
+                    "start_source_id": segment.id,
+                    "text": segment.text,
+                    "heading": "操作步骤" if index == 0 else None,
+                }
+                for index, segment in enumerate(segments)
+            ]
+        }
+        client = SequenceClient([faithful, refined])
+        paragraphs, coverage = edit_transcript(segments, client)
+        self.assertEqual(client.calls, 3)
+        self.assertEqual(coverage["quality_status"], "pass")
+        self.assertEqual(len(paragraphs), 4)
+        self.assertTrue(all(len(item.text) <= 700 for item in paragraphs))
+
+    def test_oversized_model_prose_is_split_without_losing_source_ids(self):
+        sentence = "必须保留具体按钮、参数、解释和检查方法。"
+        segments = [
+            Segment(f"s{index:06d}", (index - 1) * 10, index * 10, sentence * 5)
+            for index in range(1, 9)
+        ]
+        source_text = "".join(segment.text for segment in segments)
+        paragraphs, _ = _paragraphs_from_response(
+            {
+                "paragraphs": [
+                    {
+                        "start_source_id": "s000001",
+                        "text": source_text,
+                        "heading": "完整操作",
+                    }
+                ]
+            },
+            segments,
+        )
+        self.assertGreater(len(paragraphs), 1)
+        self.assertTrue(all(len(item.text) <= 700 for item in paragraphs))
+        self.assertEqual(
+            [source_id for paragraph in paragraphs for source_id in paragraph.source_ids],
+            [segment.id for segment in segments],
+        )
+        self.assertEqual("".join(paragraph.text for paragraph in paragraphs), source_text)
+
+    def test_program_assigns_omitted_filler_range_without_model_id_bookkeeping(self):
+        segments = [
+            Segment("s000001", 0, 1, "好，OK，接下来我们来看一下。"),
+            Segment("s000002", 1, 3, "点击插件，然后允许浏览器连接网络。"),
+        ]
+        client = FakeClient({
+            "paragraphs": [{
+                "start_source_id": "s000001",
+                "text": "点击“插件”，然后允许浏览器连接网络。",
+                "heading": None,
+            }],
+        })
+        paragraphs, coverage = edit_transcript(segments, client)
+        self.assertEqual(paragraphs[0].source_ids, ["s000001", "s000002"])
+        self.assertEqual(coverage["assignment_method"], "deterministic_start_ranges")
+
+    def test_program_expands_multiple_start_boundaries_without_model_id_lists(self):
+        segments = [
+            Segment(f"s{index:06d}", index, index + 1, f"第 {index} 条包含具体解释。")
+            for index in range(1, 6)
+        ]
+        paragraphs, removed = _paragraphs_from_response(
+            {
+                "paragraphs": [
+                    {
+                        "start_source_id": "s000001",
+                        "text": "第 1 条包含具体解释。第 2 条包含具体解释。第 3 条包含具体解释。",
+                        "heading": "第一阶段",
+                    },
+                    {
+                        "start_source_id": "s000004",
+                        "text": "第 4 条包含具体解释。第 5 条包含具体解释。",
+                        "heading": "第二阶段",
+                    },
+                ]
+            },
+            segments,
+        )
+        self.assertEqual(paragraphs[0].source_ids, ["s000001", "s000002", "s000003"])
+        self.assertEqual(paragraphs[1].source_ids, ["s000004", "s000005"])
+        self.assertEqual(
+            [source_id for paragraph in paragraphs for source_id in paragraph.source_ids],
+            [segment.id for segment in segments],
+        )
+        self.assertEqual(removed, set())
+
+    def test_start_boundary_must_begin_with_first_segment(self):
+        segments = [
+            Segment("s000001", 0, 1, "第一条内容。"),
+            Segment("s000002", 1, 2, "第二条内容。"),
+        ]
+        with self.assertRaisesRegex(ValueError, "first start_source_id must be s000001"):
+            _paragraphs_from_response(
+                {"paragraphs": [{"start_source_id": "s000002", "text": "第二条内容。"}]},
+                segments,
+            )
+
+    def test_start_boundaries_reject_duplicate_out_of_order_and_unknown_ids(self):
+        segments = [
+            Segment("s000001", 0, 1, "第一条内容。"),
+            Segment("s000002", 1, 2, "第二条内容。"),
+            Segment("s000003", 2, 3, "第三条内容。"),
+        ]
+        invalid_payloads = [
+            {
+                "paragraphs": [
+                    {"start_source_id": "s000001", "text": "第一条内容。"},
+                    {"start_source_id": "s000001", "text": "第二条内容。"},
+                ]
+            },
+            {
+                "paragraphs": [
+                    {"start_source_id": "s000001", "text": "第一条内容。"},
+                    {"start_source_id": "s000003", "text": "第三条内容。"},
+                    {"start_source_id": "s000002", "text": "第二条内容。"},
+                ]
+            },
+            {"paragraphs": [{"start_source_id": "invented", "text": "虚构内容。"}]},
+        ]
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    _paragraphs_from_response(payload, segments)
+
+    def test_duplicate_input_source_ids_are_rejected_before_assignment(self):
+        segments = [
+            Segment("s000001", 0, 1, "第一条内容。"),
+            Segment("s000001", 1, 2, "第二条内容。"),
+        ]
+        with self.assertRaisesRegex(ValueError, "duplicate source IDs"):
+            _paragraphs_from_response(
+                {"paragraphs": [{"start_source_id": "s000001", "text": "完整内容。"}]},
+                segments,
+            )
+
+    def test_malformed_model_field_types_are_rejected(self):
+        segments = [Segment("s000001", 0, 1, "第一条内容。")]
+        payloads = [
+            {"paragraphs": [{"start_source_id": ["s000001"], "text": "第一条内容。"}]},
+            {"paragraphs": [{"start_source_id": "s000001", "text": {"bad": True}}]},
+            {
+                "paragraphs": [
+                    {"start_source_id": "s000001", "text": "第一条内容。", "heading": 1}
+                ]
+            },
+        ]
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    _paragraphs_from_response(payload, segments)
+
+    def test_string_null_heading_does_not_count_as_a_real_heading(self):
+        segments = [Segment("s000001", 0, 1, "第一条内容。")]
+        paragraphs, _ = _paragraphs_from_response(
+            {
+                "paragraphs": [
+                    {"start_source_id": "s000001", "text": "第一条内容。", "heading": "null"}
+                ]
+            },
+            segments,
+        )
+        self.assertIsNone(paragraphs[0].heading)
+
+    def test_legacy_per_id_output_cannot_bypass_start_boundary_contract(self):
+        segments = [Segment("s000001", 0, 1, "第一条具体内容。")]
+        with self.assertRaisesRegex(ValueError, "start_source_id must be a string"):
+            _paragraphs_from_response(
+                {"paragraphs": [{"source_ids": ["s000001"], "text": "第一条具体内容。"}]},
+                segments,
+            )
+
+    def test_nonempty_legacy_removal_list_is_rejected(self):
+        segments = [Segment("s000001", 0, 1, "第一条具体内容。")]
+        with self.assertRaisesRegex(ValueError, "removed_filler_ids is obsolete"):
+            _paragraphs_from_response(
+                {
+                    "paragraphs": [
+                        {"start_source_id": "s000001", "text": "第一条具体内容。"}
+                    ],
+                    "removed_filler_ids": ["s000001"],
+                },
+                segments,
+            )
+
+    def test_local_range_gate_rejects_detail_loss_hidden_by_other_long_paragraphs(self):
+        segments = [
+            Segment("s000001", 0, 2, "第一阶段包含必须保留的具体解释。" * 16),
+            Segment("s000002", 2, 4, "第二阶段也包含必须保留的具体操作。" * 16),
+        ]
+        with self.assertRaisesRegex(ValueError, "local detail retention is too low"):
+            _paragraphs_from_response(
+                {
+                    "paragraphs": [
+                        {
+                            "start_source_id": "s000001",
+                            "text": "第一阶段包含必须保留的具体解释。" * 16,
+                        },
+                        {"start_source_id": "s000002", "text": "第二阶段。"},
+                    ]
+                },
+                segments,
+            )
+
+    def test_task11_regression_model_boundaries_cannot_leave_source_ids_unaccounted(self):
+        segments = [
+            Segment(
+                f"s{index:06d}",
+                index * 2,
+                (index + 1) * 2,
+                f"步骤 {index} 包含一项具体操作和必要解释。",
+            )
+            for index in range(1, 13)
+        ]
+        response = {
+            "paragraphs": [
+                {
+                    "start_source_id": "s000001",
+                    "text": " ".join(segment.text for segment in segments[:4]),
+                    "heading": "准备阶段",
+                },
+                {
+                    "start_source_id": "s000005",
+                    "text": " ".join(segment.text for segment in segments[4:8]),
+                    "heading": "执行阶段",
+                },
+                {
+                    "start_source_id": "s000009",
+                    "text": " ".join(segment.text for segment in segments[8:]),
+                    "heading": "检查阶段",
+                },
+            ]
+        }
+        paragraphs, coverage = edit_transcript(segments, FakeClient(response))
+        self.assertEqual(coverage["missing_ids"], [])
+        self.assertEqual(coverage["accounted_count"], len(segments))
+        self.assertEqual(coverage["assignment_method"], "deterministic_start_ranges")
+        self.assertEqual([item for p in paragraphs for item in p.source_ids], [s.id for s in segments])
+
+    def test_system_prompt_assigns_content_to_ai_and_bookkeeping_to_cli(self):
+        self.assertIn("长视频内容编辑", SYSTEM_PROMPT)
+        self.assertIn("每个段落只填写 `start_source_id`", SYSTEM_PROMPT)
+        self.assertIn("程序会自动", SYSTEM_PROMPT)
+        self.assertIn("不要输出 `source_ids`", SYSTEM_PROMPT)
+        self.assertIn("previous_context", FAITHFUL_SYSTEM_PROMPT)
+        self.assertIn("忠实初稿", REFINEMENT_SYSTEM_PROMPT)
+
+    def test_chunk_context_is_read_only_neighbouring_evidence(self):
+        segments = [
+            Segment(f"s{index:06d}", index, index + 1, f"第 {index} 条字幕。")
+            for index in range(1, 10)
+        ]
+        previous, subsequent = _chunk_context(segments, segments[3:6], window=2)
+        self.assertIn("s000002", previous)
+        self.assertIn("s000003", previous)
+        self.assertNotIn("s000004", previous)
+        self.assertIn("s000007", subsequent)
+        self.assertIn("s000008", subsequent)
+        self.assertNotIn("s000006", subsequent)
+
+    def test_semantic_checkpoint_requires_matching_source_signature(self):
+        segments = [
+            Segment("s000001", 0, 2, "保留完整设置步骤。"),
+            Segment("s000002", 2, 4, "保留检查方法和失败条件。"),
+        ]
+        chunks = chunk_segments(segments)
+        paragraph = Paragraph(
+            ["s000001", "s000002"],
+            "保留完整设置步骤，以及检查方法和失败条件。",
+            0,
+            4,
+            heading="设置与检查",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "checkpoint.json"
+            _save_checkpoint_chunks(path, segments, "原上下文", {1: [paragraph]})
+            restored = _load_checkpoint_chunks(path, segments, chunks, "原上下文")
+            self.assertEqual(restored[1][0].source_ids, ["s000001", "s000002"])
+            self.assertEqual(
+                _load_checkpoint_chunks(path, segments, chunks, "不同上下文"),
+                {},
+            )
+
+    def test_long_video_uses_faithful_refinement_and_whole_compose(self):
+        segments = [
+            Segment(
+                f"s{index:06d}",
+                index * 10,
+                (index + 1) * 10,
+                f"第{index}阶段需要保留入口、选项、原因、检查方法和失败条件。" * 4,
+            )
+            for index in range(1, 31)
+        ]
+
+        chunks = chunk_segments(segments)
+        self.assertGreater(len(chunks), 1)
+
+        def manuscript(scope: list[Segment], prefix: str) -> dict:
+            return {
+                "paragraphs": [
+                    {
+                        "start_source_id": scope[start].id,
+                        "text": prefix + "".join(item.text for item in scope[start : start + 4]),
+                        "heading": f"阶段 {start // 4 + 1}",
+                    }
+                    for start in range(0, len(scope), 4)
+                ]
+            }
+
+        responses: list[dict] = []
+        for chunk in chunks:
+            responses.extend([manuscript(chunk, ""), manuscript(chunk, "整理后：")])
+        responses.append(manuscript(segments, "全文编排："))
+        client = SequenceClient(responses)
+        paragraphs, coverage = edit_transcript(segments, client, context="操作教程")
+        self.assertEqual(client.calls, len(chunks) * 2 + 2)
+        self.assertEqual(
+            coverage["editing_pipeline"],
+            "faithful_then_refine_then_compose_then_bounded_proofread",
+        )
+        self.assertTrue(paragraphs[0].text.startswith("全文编排："))
+
+    def test_single_batch_skips_redundant_whole_compose(self):
+        segments = [
+            Segment(
+                f"s{index:06d}",
+                index * 10,
+                (index + 1) * 10,
+                f"第{index}阶段需要保留入口、选项、原因、检查方法和失败条件。" * 4,
+            )
+            for index in range(1, 21)
+        ]
+        self.assertEqual(len(chunk_segments(segments)), 1)
+
+        def manuscript(prefix: str) -> dict:
+            return {
+                "paragraphs": [
+                    {
+                        "start_source_id": segments[start].id,
+                        "text": prefix + "".join(item.text for item in segments[start : start + 5]),
+                        "heading": f"阶段 {start // 5 + 1}",
+                    }
+                    for start in range(0, 20, 5)
+                ]
+            }
+
+        client = SequenceClient(
+            [manuscript(""), manuscript("整理后："), manuscript("不应调用：")]
+        )
+        paragraphs, coverage = edit_transcript(segments, client, context="操作教程")
+        self.assertEqual(client.calls, 3)
+        self.assertEqual(coverage["quality_status"], "pass")
+        self.assertTrue(paragraphs[0].text.startswith("整理后："))
+
+    def test_optional_refinement_failure_keeps_valid_faithful_draft(self):
+        segments = [
+            Segment(
+                f"s{index:06d}",
+                index * 10,
+                (index + 1) * 10,
+                f"第{index}阶段需要保留入口、选项、原因、检查方法和失败条件。" * 4,
+            )
+            for index in range(1, 21)
+        ]
+        faithful = {
+            "paragraphs": [
+                {
+                    "start_source_id": segments[start].id,
+                    "text": "".join(item.text for item in segments[start : start + 5]),
+                    "heading": f"阶段 {start // 5 + 1}",
+                }
+                for start in range(0, 20, 5)
+            ]
+        }
+        invalid = {"paragraphs": []}
+        client = SequenceClient([faithful, invalid, invalid, invalid, invalid, invalid])
+        paragraphs, coverage = edit_transcript(segments, client, context="操作教程")
+        self.assertEqual(coverage["quality_status"], "pass")
+        self.assertEqual(len(paragraphs), 4)
+        self.assertTrue(any("已保留" in warning for warning in coverage["warnings"]))
+
+    def test_llm_retries_transient_transport_failure_without_leaking_response(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b'{"choices":[{"message":{"content":"ok"}}]}'
+
+        client = OpenAICompatibleClient(
+            api_key="secret", base_url="https://example.test", model="test",
+            retry_attempts=3, retry_backoff=0,
+        )
+        with patch(
+            "vtm_core.llm.urllib.request.urlopen",
+            side_effect=[urllib.error.URLError("temporary"), Response()],
+        ) as urlopen:
+            self.assertEqual(client.chat([{"role": "user", "content": "hi"}]), "ok")
+        self.assertEqual(urlopen.call_count, 2)
+
+    def test_ocr_gibberish_filter_preserves_useful_chinese_and_code(self):
+        self.assertTrue(ocr_text_is_usable("设置 API Key 并点击保存", 82))
+        self.assertTrue(ocr_text_is_usable("python main.py --force", 76))
+        self.assertFalse(ocr_text_is_usable("□□□◆◆�", 90))
+        self.assertFalse(ocr_text_is_usable("abc", 90))
+
+    def test_ai_cannot_add_editor_commentary_absent_from_the_source(self):
+        segments = [Segment("s000001", 0, 2, "作者介绍了配置步骤和命令。")]
+        client = FakeClient(
+            {
+                "paragraphs": [
+                    {
+                        "start_source_id": "s000001",
+                        "text": "作者介绍了配置步骤和命令。这说明它适合所有人。",
+                    }
+                ]
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "质量门禁"):
+            edit_transcript(segments, client)
+
+    def test_speaker_owned_commentary_phrase_is_not_removed_by_the_gate(self):
+        segments = [Segment("s000001", 0, 2, "作者说，这说明配置已经成功。")]
+        client = FakeClient(
+            {
+                "paragraphs": [
+                    {"start_source_id": "s000001", "text": "作者说，这说明配置已经成功。"}
+                ]
+            }
+        )
+        paragraphs, coverage = edit_transcript(segments, client)
+        self.assertEqual(coverage["quality_status"], "pass")
+        self.assertIn("这说明", paragraphs[0].text)
+
+    def test_full_gate_detects_missing_duplicate_and_out_of_order_source_ids(self):
+        segments = [
+            Segment("s000001", 0, 1, "第一条。"),
+            Segment("s000002", 1, 2, "第二条。"),
+            Segment("s000003", 2, 3, "第三条。"),
+        ]
+        invalid = [
+            [Paragraph(["s000001", "s000003"], "第一条。第三条。", 0, 3)],
+            [Paragraph(["s000001", "s000002", "s000002", "s000003"], "完整内容。", 0, 3)],
+            [Paragraph(["s000002", "s000001", "s000003"], "完整内容。", 0, 3)],
+        ]
+        for paragraphs in invalid:
+            with self.subTest(source_ids=paragraphs[0].source_ids):
+                with self.assertRaisesRegex(ValueError, "incomplete, duplicated, or out of order"):
+                    _validate_full_manuscript(segments, paragraphs)
+
+    def test_transition_prefix_cannot_hide_meaningful_operation(self):
+        segments = [Segment("s000001", 0, 2, "好，接下来点击插件并允许网络访问。")]
+        client = FakeClient({"paragraphs": []})
+        with self.assertRaisesRegex(RuntimeError, "质量门禁"):
+            edit_transcript(segments, client)
+
+    def test_overcompressed_model_output_blocks_publication(self):
+        source = "这里包含一个很长而且不能删除的具体解释和操作步骤。"
+        segments = [Segment("s000001", 0, 2, source)]
+        client = FakeClient(
+            {"paragraphs": [{"start_source_id": "s000001", "text": "步骤。"}]}
+        )
+        with self.assertRaisesRegex(RuntimeError, "质量门禁"):
+            edit_transcript(segments, client)
+
+    def test_long_video_cannot_become_one_giant_paragraph(self):
+        segments = [
+            Segment(f"s{index:06d}", index * 10, (index + 1) * 10, "这是必须保留的详细步骤和解释。" * 8)
+            for index in range(60)
+        ]
+        giant = "".join(segment.text for segment in segments)
+        client = FakeClient({
+            "paragraphs": [{"start_source_id": segments[0].id, "text": giant, "heading": None}],
+        })
+        with self.assertRaisesRegex(RuntimeError, "质量门禁"):
+            edit_transcript(segments, client)
+
+    def test_full_draft_is_sent_back_to_llm_for_structural_rework(self):
+        segments = [
+            Segment(f"s{index:06d}", index * 50, (index + 1) * 50, f"第 {index} 步包含必须保留的操作和解释。")
+            for index in range(1, 5)
+        ]
+        first = {
+            "paragraphs": [
+                {"start_source_id": segment.id, "text": segment.text, "heading": None}
+                for segment in segments
+            ],
+        }
+        repaired = {
+            "paragraphs": [
+                {
+                    "start_source_id": segment.id,
+                    "text": segment.text,
+                    "heading": f"操作阶段 {index}" if index <= 2 else None,
+                }
+                for index, segment in enumerate(segments, start=1)
+            ],
+        }
+        client = SequenceClient([first, repaired])
+        paragraphs, coverage = edit_transcript(segments, client, context="测试操作视频")
+        self.assertEqual(client.calls, 3)
+        self.assertEqual(coverage["quality_status"], "pass")
+        self.assertGreaterEqual(sum(bool(item.heading) for item in paragraphs), 2)
+
+    def test_full_draft_gets_two_rework_attempts(self):
+        segments = [
+            Segment(
+                f"s{index:06d}",
+                index * 50,
+                (index + 1) * 50,
+                f"第 {index} 步包含必须保留的操作和解释。",
+            )
+            for index in range(1, 5)
+        ]
+        unstructured = {
+            "paragraphs": [
+                {"start_source_id": segment.id, "text": segment.text, "heading": None}
+                for segment in segments
+            ],
+        }
+        repaired = {
+            "paragraphs": [
+                {
+                    "start_source_id": segment.id,
+                    "text": segment.text,
+                    "heading": f"操作阶段 {index}" if index <= 2 else None,
+                }
+                for index, segment in enumerate(segments, start=1)
+            ],
+        }
+        client = SequenceClient([unstructured, unstructured, repaired])
+        paragraphs, coverage = edit_transcript(segments, client, context="测试操作视频")
+        self.assertEqual(client.calls, 2 + FULL_MANUSCRIPT_REPAIR_ATTEMPTS)
+        self.assertEqual(coverage["quality_status"], "pass")
+        self.assertGreaterEqual(sum(bool(item.heading) for item in paragraphs), 2)
+
+    def test_reported_v5_raw_asr_dump_fails_release_gate(self):
+        source = [
+            Segment(
+                "s000001",
+                0,
+                160,
+                "今天手把手教同学们使用 Codex 查找论文参考文献。" * 80,
+            )
+        ]
+        bad = [
+            Paragraph(
+                ["s000001"],
+                "goodex 连接网络后一个个文文真毫毫地运行。" * 80,
+                0,
+                160,
+                heading=None,
+            )
+        ]
+        with self.assertRaisesRegex(ValueError, "paragraph longer than 700"):
+            _validate_full_manuscript(source, bad)
+
+    def test_irrelevant_nearby_screen_is_not_inserted(self):
+        paragraphs = [Paragraph(["s1"], "UP 主正在介绍 Codex 的设置。", 0, 4)]
+        frames = [Frame(
+            2,
+            "/tmp/unrelated.png",
+            ["s1"],
+            ocr_text="PubMed Save Email Send to",
+            ocr_confidence=90,
+        )]
+        client = FakeClient({
+            "relevance": "low",
+            "content_kind": "ui",
+            "visual_note": None,
+            "keep_image": True,
+            "confidence": "high",
+            "completeness": "complete",
+            "information_density": "low",
+        })
+        enrich_with_visual_evidence(paragraphs, frames, client)
+        self.assertIsNone(paragraphs[0].visual_note)
+        self.assertEqual(frames[0].paragraph_index, 0)
+        self.assertFalse(frames[0].keep_image)
+
+    def test_decorative_programmer_cartoon_is_discarded(self):
+        paragraphs = [Paragraph(["s1"], "有人提交新代码后，旧索引会与实际代码漂移。", 0, 4)]
+        frames = [Frame(
+            2,
+            "/tmp/programmer-cartoon.png",
+            ["s1"],
+            ocr_text="提交新代码 有人新提交了代码",
+            ocr_confidence=91,
+            vision_description="程序员敲键盘的卡通插画，旁边重复显示提交新代码。",
+        )]
+        client = FakeClient({
+            "relevance": "low",
+            "content_kind": "decorative",
+            "information_gain": "none",
+            "visual_note": None,
+            "keep_image": False,
+            "confidence": "high",
+            "completeness": "complete",
+            "information_density": "low",
+        })
+        warnings = enrich_with_visual_evidence(paragraphs, frames, client)
+        self.assertEqual(warnings, [])
+        self.assertFalse(frames[0].keep_image)
+        self.assertEqual(frames[0].content_kind, "decorative")
+        self.assertEqual(frames[0].information_gain, "none")
+        self.assertIsNone(paragraphs[0].visual_note)
+
+    def test_zero_information_gain_simple_arrow_is_discarded(self):
+        paragraphs = [Paragraph(["s1"], "RAG 方案会生成 embedding，存在信息泄露风险。", 0, 4)]
+        frames = [Frame(
+            2,
+            "/tmp/simple-arrow.png",
+            ["s1"],
+            ocr_text="RAG 方案 → embedding 信息泄露风险",
+            ocr_confidence=93,
+        )]
+        client = FakeClient({
+            "relevance": "high",
+            "content_kind": "comparison",
+            "information_gain": "none",
+            "visual_note": None,
+            "keep_image": True,
+            "confidence": "high",
+            "completeness": "complete",
+            "information_density": "low",
+        })
+        enrich_with_visual_evidence(paragraphs, frames, client)
+        self.assertFalse(frames[0].keep_image)
+        self.assertIsNone(paragraphs[0].visual_note)
+
+    def test_verbose_vision_description_does_not_make_simple_text_dense(self):
+        paragraphs = [Paragraph(["s1"], "作者展示了 Claude Code 与 Cursor 的取舍。", 0, 4)]
+        frames = [Frame(
+            2,
+            "/tmp/simple-comparison.png",
+            ["s1"],
+            ocr_text="Claude Code → 极简；Cursor → 向量索引",
+            ocr_confidence=93,
+            vision_description="视觉模型对简单画面给出了很长的逐字说明。" * 40,
+        )]
+        client = FakeClient({
+            "relevance": "high",
+            "content_kind": "text",
+            "information_gain": "partial",
+            "visual_note": "Claude Code → 极简；Cursor → 向量索引。",
+            "keep_image": True,
+            "confidence": "high",
+            "completeness": "complete",
+            "information_density": "low",
+        })
+        enrich_with_visual_evidence(paragraphs, frames, client)
+        self.assertFalse(frames[0].keep_image)
+        self.assertIn("Cursor", paragraphs[0].visual_note or "")
+
+    def test_short_transcribed_text_slide_does_not_keep_image_for_cautious_partial_label(self):
+        paragraphs = [Paragraph(["s1"], "精确搜索不存在语义漂移。", 0, 4)]
+        frames = [Frame(
+            2,
+            "/tmp/polarity-slide.png",
+            ["s1"],
+            vision_description="画面写着不存在语义漂移的问题。",
+        )]
+        client = FakeClient({
+            "relevance": "high",
+            "content_kind": "text",
+            "information_gain": "partial",
+            "visual_note": "不存在语义漂移的问题。",
+            "keep_image": True,
+            "confidence": "high",
+            "completeness": "partial",
+            "information_density": "low",
+        })
+        enrich_with_visual_evidence(paragraphs, frames, client)
+        self.assertFalse(frames[0].keep_image)
+        self.assertIn("语义漂移", paragraphs[0].visual_note or "")
+
+    def test_relevant_screen_without_complete_transcription_keeps_original_image(self):
+        paragraphs = [Paragraph(["s1"], "UP 主正在展示配置界面。", 0, 4)]
+        frames = [
+            Frame(
+                2,
+                "/tmp/config.png",
+                ["s1"],
+                ocr_text="API Key Advanced Settings",
+                ocr_confidence=90,
+            )
+        ]
+        client = FakeClient(
+            {
+                "relevance": "high",
+                "content_kind": "ui",
+                "visual_note": None,
+                "keep_image": True,
+                "confidence": "medium",
+                "completeness": "partial",
+                "information_density": "high",
+            }
+        )
+        enrich_with_visual_evidence(paragraphs, frames, client)
+        self.assertEqual(frames[0].paragraph_index, 0)
+        self.assertTrue(frames[0].keep_image)
+        self.assertEqual(plan_frame_evidence(paragraphs, frames)[0], frames[0])
+
+    def test_visual_classification_error_keeps_the_aligned_original(self):
+        class BrokenClient:
+            def chat(self, messages, **kwargs):
+                raise RuntimeError("temporary model failure")
+
+        paragraphs = [Paragraph(["s1"], "UP 主正在展示流程图。", 0, 4)]
+        frames = [
+            Frame(
+                2,
+                "/tmp/diagram.png",
+                ["s1"],
+                vision_description="画面是一张多节点流程图。",
+            )
+        ]
+        warnings = enrich_with_visual_evidence(paragraphs, frames, BrokenClient())
+        self.assertEqual(frames[0].paragraph_index, 0)
+        self.assertTrue(frames[0].keep_image)
+        self.assertTrue(warnings)
+
+    def test_visual_evidence_for_multiple_paragraphs_uses_one_text_model_call(self):
+        class BatchClient:
+            def __init__(self):
+                self.calls = 0
+
+            def chat(self, messages, **kwargs):
+                self.calls += 1
+                request = json.loads(messages[-1]["content"])
+                return json.dumps(
+                    {
+                        "items": [
+                            {
+                                "item_id": item["item_id"],
+                                "relevance": "high",
+                                "content_kind": "ui",
+                                "visual_note": "画面显示对应的操作界面。",
+                                "keep_image": True,
+                                "confidence": "high",
+                                "completeness": "partial",
+                                "information_density": "high",
+                            }
+                            for item in request["items"]
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+
+        paragraphs = [
+            Paragraph(["s1"], "第一处操作。", 0, 4),
+            Paragraph(["s2"], "第二处操作。", 5, 9),
+        ]
+        frames = [
+            Frame(2, "/tmp/one.png", ["s1"], ocr_text="设置界面第一处包含完整选项名称", ocr_confidence=90),
+            Frame(7, "/tmp/two.png", ["s2"], ocr_text="设置界面第二处包含完整参数名称", ocr_confidence=90),
+        ]
+        client = BatchClient()
+        warnings = enrich_with_visual_evidence(paragraphs, frames, client)
+        self.assertEqual(warnings, [])
+        self.assertEqual(client.calls, 1)
+        self.assertEqual([frame.paragraph_index for frame in frames], [0, 1])
+        self.assertTrue(all(frame.keep_image for frame in frames))
+
+    def test_exact_episode_identifier_cannot_be_genericized_away(self):
+        segments = [Segment("s000001", 0, 2, "推荐 E238 Harness 这一期。")]
+        client = FakeClient(
+            {"paragraphs": [{"start_source_id": "s000001", "text": "推荐这一期。"}]}
+        )
+        with self.assertRaisesRegex(RuntimeError, "质量门禁"):
+            edit_transcript(segments, client)
+
+    def test_arbitrary_titles_commands_and_person_names_cannot_be_genericized(self):
+        segments = [
+            Segment(
+                "s000001",
+                0,
+                4,
+                "推荐《Harness 时代 AI-First 的组织架构》，对话张咋啦这一期，"
+                "配置 Claude.md 后执行 --force。",
+            )
+        ]
+        client = FakeClient(
+            {
+                "paragraphs": [
+                    {
+                        "start_source_id": "s000001",
+                        "text": "推荐一期节目，并配置文件后执行命令。",
+                    }
+                ],
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "质量门禁"):
+            edit_transcript(segments, client)
+
+    def test_known_asr_product_alias_can_be_corrected_without_conflicting_gates(self):
+        segments = [Segment("s000001", 0, 2, "使用 goodex 生成论文初稿。")]
+        client = FakeClient(
+            {
+                "paragraphs": [
+                    {"start_source_id": "s000001", "text": "使用 Codex 生成论文初稿。"}
+                ]
+            }
+        )
+        paragraphs, coverage = edit_transcript(segments, client)
+        self.assertEqual(coverage["quality_status"], "pass")
+        self.assertIn("Codex", paragraphs[0].text)
+
+    def test_plain_lowercase_english_ui_word_is_not_an_exact_anchor(self):
+        segments = [Segment("s000001", 0, 2, "点击 open 打开文件，然后继续操作。")]
+        self.assertNotIn("open", exact_anchors(segments))
+        client = FakeClient(
+            {
+                "paragraphs": [
+                    {
+                        "start_source_id": "s000001",
+                        "text": "点击“打开”进入文件，然后继续操作。",
+                    }
+                ]
+            }
+        )
+        paragraphs, coverage = edit_transcript(segments, client)
+        self.assertEqual(coverage["quality_status"], "pass")
+        self.assertNotIn("open", paragraphs[0].text.lower())
+
+    def test_unknown_two_letter_asr_fragment_is_not_an_exact_anchor(self):
+        segments = [Segment("s000001", 0, 2, "然后 SR 再继续生成论文。")]
+        self.assertNotIn("SR", exact_anchors(segments))
+        client = FakeClient(
+            {
+                "paragraphs": [
+                    {
+                        "start_source_id": "s000001",
+                        "text": "然后继续生成论文。",
+                    }
+                ]
+            }
+        )
+        paragraphs, coverage = edit_transcript(segments, client)
+        self.assertEqual(coverage["quality_status"], "pass")
+        self.assertNotIn("SR", paragraphs[0].text)
+
+    def test_known_two_letter_technical_acronyms_remain_exact_anchors(self):
+        segments = [
+            Segment(
+                "s000001",
+                0,
+                2,
+                "使用 AI、ML、UI、UX、VR、AR、PE 和 PM 完成这一步。",
+            )
+        ]
+        anchors = exact_anchors(segments)
+        for expected in ("AI", "ML", "UI", "UX", "VR", "AR", "PE", "PM"):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, anchors)
+
+    def test_structured_and_domain_english_anchors_remain_enforced(self):
+        segments = [
+            Segment(
+                "s000001",
+                0,
+                3,
+                "使用 OpenAI、FDE、Claude.md、--force、E238 和 20 分钟作为具体信息。",
+            )
+        ]
+        anchors = exact_anchors(segments)
+        for expected in ("OpenAI", "FDE", "Claude.md", "--force", "E238", "20 分钟"):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, anchors)
+
+    def test_ocr_evidence_is_separate_from_spoken_text(self):
+        paragraphs = [Paragraph(["s1"], "UP 主只说推荐这期。", 0, 4)]
+        frames = [Frame(2, "/tmp/frame.png", ["s1"], ocr_text="E238 Harness 时代 AI-First", ocr_confidence=90)]
+        client = FakeClient({
+            "relevance": "high",
+            "content_kind": "text",
+            "visual_note": "画面显示完整标题：E238 Harness 时代 AI-First。",
+            "keep_image": False,
+            "confidence": "high",
+            "completeness": "complete",
+            "information_density": "low",
+        })
+        warnings = enrich_with_visual_evidence(paragraphs, frames, client)
+        self.assertEqual(warnings, [])
+        self.assertEqual(paragraphs[0].text, "UP 主只说推荐这期。")
+        self.assertIn("E238", paragraphs[0].visual_note or "")
+        self.assertFalse(frames[0].keep_image)
+
+    def test_complete_low_density_text_deterministically_replaces_image(self):
+        paragraphs = [Paragraph(["s1"], "作者展示了一行配置。", 0, 4)]
+        frames = [Frame(
+            2,
+            "/tmp/simple-text.png",
+            ["s1"],
+            ocr_text="VTM_FINAL_VISUAL_HEIGHT=1080",
+            ocr_confidence=92,
+            vision_description="画面完整显示一行配置：VTM_FINAL_VISUAL_HEIGHT=1080。",
+        )]
+        client = FakeClient({
+            "relevance": "high",
+            "content_kind": "text",
+            "visual_note": "`VTM_FINAL_VISUAL_HEIGHT=1080`",
+            "keep_image": True,
+            "confidence": "high",
+            "completeness": "complete",
+            "information_density": "low",
+        })
+        enrich_with_visual_evidence(paragraphs, frames, client)
+        self.assertFalse(frames[0].keep_image)
+        self.assertIn("1080", paragraphs[0].visual_note or "")
+
+    def test_redundant_complete_simple_text_without_unique_note_removes_image(self):
+        paragraphs = [Paragraph(["s1"], "课程共四个多小时，配有近 200 页讲义。", 0, 4)]
+        frames = [Frame(
+            2,
+            "/tmp/course-duration.png",
+            ["s1"],
+            ocr_text="课程 4 小时 近 200 页讲义",
+            ocr_confidence=87,
+            vision_description="画面完整显示课程时长和讲义页数，与口述一致。",
+        )]
+        client = FakeClient({
+            "relevance": "high",
+            "content_kind": "text",
+            "visual_note": None,
+            "keep_image": True,
+            "confidence": "high",
+            "completeness": "complete",
+            "information_density": "low",
+        })
+        enrich_with_visual_evidence(paragraphs, frames, client)
+        self.assertFalse(frames[0].keep_image)
+        self.assertIsNone(paragraphs[0].visual_note)
+
+    def test_partial_or_dense_screen_cannot_be_deleted(self):
+        paragraphs = [Paragraph(["s1"], "UP 主介绍推荐节目。", 0, 4)]
+        frames = [Frame(
+            2,
+            "/tmp/dense.png",
+            ["s1"],
+            ocr_text="完整提示词 " * 80,
+            vision_description="这是一个包含多段配置的长提示词界面。",
+        )]
+        client = FakeClient({
+            "relevance": "high",
+            "content_kind": "text",
+            "visual_note": "画面提示词要求每天抓取最近 24 小时的 AI 新闻。",
+            "keep_image": False,
+            "confidence": "high",
+            "completeness": "partial",
+            "information_density": "high",
+        })
+        enrich_with_visual_evidence(paragraphs, frames, client)
+        self.assertTrue(frames[0].keep_image)
+        self.assertEqual(frames[0].evidence_completeness, "partial")
+        self.assertIsNone(paragraphs[0].visual_note)
+
+    def test_medium_confidence_visual_text_is_not_published_but_image_is_kept(self):
+        paragraphs = [Paragraph(["s1"], "UP 主展示操作界面。", 0, 4)]
+        frames = [Frame(
+            2,
+            "/tmp/dense.png",
+            ["s1"],
+            ocr_text="疑似识别出的长提示词",
+            vision_description="可能包含不可完全确认的按钮和参数。",
+        )]
+        client = FakeClient({
+            "relevance": "high",
+            "content_kind": "ui",
+            "visual_note": "画面显示按钮 cvs 和韩文网站名称。",
+            "keep_image": True,
+            "confidence": "medium",
+            "completeness": "partial",
+            "information_density": "high",
+        })
+        enrich_with_visual_evidence(paragraphs, frames, client)
+        self.assertTrue(frames[0].keep_image)
+        self.assertIsNone(paragraphs[0].visual_note)
+        self.assertEqual(frames[0].extracted_markdown, "")
+
+    def test_nearby_similar_aligned_frames_keep_only_stronger_evidence(self):
+        paragraphs = [
+            Paragraph(["s1"], "第一段。", 78, 81),
+            Paragraph(["s2"], "第二段。", 81, 84),
+        ]
+        weaker = Frame(
+            80.4,
+            "/tmp/weak.png",
+            ["s1"],
+            ahash="0" * 64,
+            paragraph_index=0,
+            evidence_confidence="medium",
+            evidence_completeness="partial",
+            ocr_confidence=18.5,
+        )
+        paragraphs[0].visual_note = "较弱截图的识别文字"
+        weaker.extracted_markdown = "较弱截图的识别文字"
+        stronger = Frame(
+            81.8,
+            "/tmp/strong.png",
+            ["s2"],
+            ahash="0" * 63 + "1",
+            paragraph_index=1,
+            evidence_confidence="medium",
+            evidence_completeness="partial",
+            ocr_confidence=19.5,
+        )
+        plan = plan_frame_evidence(paragraphs, [weaker, stronger])
+        self.assertEqual(list(plan), [1])
+        self.assertIs(plan[1], stronger)
+        self.assertIsNone(paragraphs[0].visual_note)
+        self.assertEqual(weaker.extracted_markdown, "")
+
+    def test_common_asr_product_and_csv_reversals_are_normalized(self):
+        paragraphs, _ = _paragraphs_from_response(
+            {
+                "paragraphs": [
+                    {
+                        "start_source_id": "s1",
+                        "text": "用 oodex 生成文献，并在 cvs 中打开，再导入 sy paper。",
+                        "heading": None,
+                    }
+                ]
+            },
+            [Segment("s1", 0, 2, "用Codex生成文献，在CSV中打开，导入SY Paper。")],
+            enforce_structure=False,
+        )
+        self.assertIn("Codex", paragraphs[0].text)
+        self.assertIn("CSV", paragraphs[0].text)
+        self.assertIn("SY Paper", paragraphs[0].text)
+        self.assertNotIn("cvs", paragraphs[0].text.lower())
+
+    def test_bounded_asr_proofread_applies_unique_conservative_correction(self):
+        segments = [
+            Segment("s1", 0, 3, "上传真实参考文献和三一大纲政策后生成初稿。"),
+        ]
+        paragraphs = [
+            Paragraph(["s1"], "上传真实参考文献和三一大纲政策后生成初稿。", 0, 3)
+        ]
+        client = FakeClient({
+            "corrections": [
+                {
+                    "original": "三一大纲政策",
+                    "replacement": "已经确定的大纲",
+                }
+            ]
+        })
+        repaired, warnings = _proofread_asr_artifacts(segments, paragraphs, client)
+        self.assertIn("已经确定的大纲", repaired[0].text)
+        self.assertTrue(any("应用 1 处" in warning for warning in warnings))
+
+    def test_bounded_asr_proofread_rejects_new_exact_number(self):
+        segments = [Segment("s1", 0, 3, "平台自带大型文献库。")]
+        paragraphs = [Paragraph(["s1"], "平台自带大型文献库。", 0, 3)]
+        client = FakeClient({
+            "corrections": [
+                {"original": "大型文献库", "replacement": "7 亿篇文献库"}
+            ]
+        })
+        repaired, _warnings = _proofread_asr_artifacts(segments, paragraphs, client)
+        self.assertEqual(repaired[0].text, "平台自带大型文献库。")
+
+    def test_bounded_asr_proofread_dequantifies_invented_chinese_count(self):
+        segments = [Segment("s1", 0, 3, "平台自带超期一篇文献的数据库。")]
+        paragraphs = [Paragraph(["s1"], "平台自带超七篇文献的数据库。", 0, 3)]
+        client = FakeClient({
+            "corrections": [
+                {"original": "自带超七篇文献", "replacement": "自带超七千篇文献"}
+            ]
+        })
+        repaired, _warnings = _proofread_asr_artifacts(segments, paragraphs, client)
+        self.assertEqual(repaired[0].text, "平台自带大量文献的数据库。")
+
+    def test_bounded_asr_proofread_dequantifies_unflagged_malformed_count(self):
+        segments = [Segment("s1", 0, 3, "平台自带超期一篇文献。")]
+        paragraphs = [Paragraph(["s1"], "平台自带超七篇文献。", 0, 3)]
+        repaired, warnings = _proofread_asr_artifacts(
+            segments,
+            paragraphs,
+            FakeClient({"corrections": []}),
+        )
+        self.assertEqual(repaired[0].text, "平台自带大量文献。")
+        self.assertTrue(any("不可靠数量去量化 1 处" in item for item in warnings))
+
+    def test_bounded_asr_proofread_repairs_unflagged_outline_gibberish(self):
+        segments = [Segment("s1", 0, 3, "参考文献和三一大纲政策论文初稿完成。")]
+        paragraphs = [
+            Paragraph(["s1"], "参考文献和三大纲政策论文初稿完成。", 0, 3)
+        ]
+        repaired, warnings = _proofread_asr_artifacts(
+            segments,
+            paragraphs,
+            FakeClient({"corrections": []}),
+        )
+        self.assertEqual(repaired[0].text, "参考文献和大纲生成的论文初稿完成。")
+        self.assertTrue(any("不成句大纲短语" in item for item in warnings))
+
+    def test_retained_frames_are_replaced_from_1080_stream_by_timestamp(self):
+        info = VideoInfo(
+            url="https://www.bilibili.com/video/BV1ab411c7DE",
+            bvid="BV1ab411c7DE",
+            cid=42,
+            part=1,
+            title="demo",
+            part_title="demo",
+            duration=10,
+            owner="",
+            cover="",
+        )
+        class Client:
+            def media_stream(self, inspected, *, audio_only, max_height):
+                self.requested = max_height
+                return {
+                    "url": "https://v.bilivideo.com/1080.m4s",
+                    "height": 1080,
+                }
+
+        with tempfile.TemporaryDirectory() as temp:
+            image = Path(temp) / "frame.png"
+            image.write_bytes(b"analysis")
+            frame = Frame(12.345, str(image), ["s1"], keep_image=True)
+            commands = []
+            def fake_run(command, **kwargs):
+                commands.append(command)
+                Path(command[-1]).write_bytes(b"high-resolution")
+            client = Client()
+            with patch("vtm_core.visual.require_command", return_value="ffmpeg"), patch(
+                "vtm_core.visual._run", side_effect=fake_run
+            ):
+                result = recapture_retained_frames(client, info, [frame], max_height=1080)
+            self.assertEqual(image.read_bytes(), b"high-resolution")
+            self.assertEqual(frame.final_height, 1080)
+            self.assertEqual(result["upgraded_count"], 1)
+            self.assertIn("12.345", commands[0])
+
+    def test_visual_asset_filename_uses_only_task_sequence_and_timestamp(self):
+        name = asset_filename("20260717-3 中文标题", 1, 122.4)
+        self.assertEqual(name, "20260717-3-001-02m02s.png")
+        self.assertTrue(name.isascii())
+
+    def test_missing_captured_candidate_is_skipped_instead_of_failing_task(self):
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "vtm_core.visual.probe_duration", return_value=30.0
+        ), patch(
+            "vtm_core.visual.calibrate_threshold", return_value=0.3
+        ), patch(
+            "vtm_core.visual.detect_scenes", return_value=[]
+        ), patch(
+            "vtm_core.visual.candidate_times", return_value=[(2.0, 1.0)]
+        ), patch(
+            "vtm_core.visual.raw_gray_frame", return_value=bytes(range(256)) * 4
+        ), patch(
+            "vtm_core.visual.average_hash", return_value=0
+        ), patch(
+            "vtm_core.visual.quality", return_value=(0.5, 0.5)
+        ), patch(
+            "vtm_core.visual.capture_frame", return_value=None
+        ):
+            frames, metadata = extract_useful_frames(
+                Path(temp) / "video.mp4",
+                Path(temp),
+                [Segment("s1", 0, 4, "这里展示一个画面。")],
+                max_frames=6,
+                task_key="20260717-3",
+            )
+        self.assertEqual(frames, [])
+        self.assertEqual(metadata["candidate_count"], 0)
+
+    def test_configured_vision_model_describes_visible_text(self):
+        class Vision:
+            def chat(self, messages, **kwargs):
+                return "画面显示节目标题 E238。"
+
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "vtm_core.visual.vision_client", return_value=Vision()
+        ):
+            image = Path(temp) / "frame.png"
+            image.write_bytes(b"png")
+            result = describe_if_needed(image, "附近字幕", "E238")
+            self.assertIn("E238", result)
+
+    def test_giant_asr_segment_is_resegmented(self):
+        text = "第一句有具体内容。第二句保留解释。第三句包含操作步骤。" * 8
+        repaired = normalize_segments([Segment("s1", 0, 120, text)], 120)
+        self.assertGreater(len(repaired), 4)
+        self.assertLess(max(item.end - item.start for item in repaired), 45)
+
+    def test_synthetic_regression_cannot_remain_one_five_minute_segment(self):
+        fixture = Path(__file__).parent / "fixtures" / "synthetic-bad-raw-transcript.json"
+        payload = json.loads(fixture.read_text(encoding="utf-8"))
+        segments = [Segment(**item) for item in payload["segments"]]
+        repaired = normalize_segments(segments, 302.23)
+        self.assertGreater(len(repaired), 20)
+        self.assertLess(max(item.end - item.start for item in repaired), 35)
+
+    def test_hash_and_quality(self):
+        dark = bytes([0] * 1024)
+        split = bytes([0] * 512 + [255] * 512)
+        self.assertEqual(hash_distance(average_hash(dark), average_hash(dark)), 0)
+        self.assertGreater(hash_distance(average_hash(dark), average_hash(split)), 0.4)
+        brightness, contrast = quality(split)
+        self.assertAlmostEqual(brightness, 0.5, places=2)
+        self.assertGreater(contrast, 0.9)
+
+    def test_text_evidence_windows_keep_small_same_template_changes(self):
+        requests = [{
+            "time_start": 90,
+            "time_end": 100,
+            "purpose": "核验连续两句技术结论",
+            "expected_kind": "text",
+        }]
+        self.assertEqual(duplicate_distance_threshold(95, requests), 0.045)
+        self.assertEqual(duplicate_distance_threshold(120, requests), 0.10)
+
+    def test_vision_budget_is_temporally_distributed_and_uses_best_in_each_region(self):
+        self.assertEqual(DEFAULT_VISION_FRAME_BUDGET, 6)
+        self.assertEqual(MAX_ADAPTIVE_VISION_FRAME_BUDGET, 60)
+        self.assertEqual(adaptive_vision_frame_budget(6 * 60, 18), 6)
+        self.assertEqual(adaptive_vision_frame_budget(20 * 60, 30), 20)
+        self.assertEqual(adaptive_vision_frame_budget(60 * 60, 30), 30)
+        self.assertEqual(adaptive_vision_frame_budget(60 * 60, 8), 8)
+        early = Frame(1, "/tmp/early.png")
+        useful = Frame(20, "/tmp/useful.png")
+        clustered = Frame(30, "/tmp/clustered.png")
+        later = Frame(90, "/tmp/later.png")
+        chosen = vision_priority_ids(
+            [(early, 1.0), (useful, 9.0), (clustered, 8.0), (later, 4.0)],
+            2,
+            duration=120,
+        )
+        self.assertNotIn(id(early), chosen)
+        self.assertIn(id(useful), chosen)
+        self.assertIn(id(later), chosen)
+        self.assertNotIn(id(clustered), chosen)
+
+    def test_semantic_vision_budget_follows_requested_distinct_slides_not_duration(self):
+        selected = [
+            (Frame(timestamp, f"/tmp/{index}.png"), 5.0)
+            for index, timestamp in enumerate((10, 12, 14, 16, 18, 20, 200), start=1)
+        ]
+        requests = [
+            {
+                "time_start": 9,
+                "time_end": 21,
+                "purpose": "逐页读取研究方法 PPT",
+                "expected_kind": "text",
+            }
+        ]
+        with patch.dict(os.environ, {"VTM_MAX_VISION_FRAMES": "60"}):
+            self.assertEqual(
+                semantic_vision_frame_budget(selected, requests, max_frames=60),
+                6,
+            )
+        chosen = vision_priority_ids_for_requests(
+            selected,
+            budget=6,
+            duration=240,
+            visual_requests=requests,
+        )
+        self.assertEqual(chosen, {id(frame) for frame, _score in selected[:6]})
+
+    def test_semantic_vision_budget_has_dynamic_cost_cap(self):
+        self.assertEqual(MAX_PAID_VISION_REVIEWS_PER_MINUTE, 2)
+        selected = [
+            (Frame(float(index * 20), f"/tmp/{index}.png"), 5.0)
+            for index in range(1, 61)
+        ]
+        requests = [{
+            "time_start": 0,
+            "time_end": 1200,
+            "purpose": "检查 20 分钟技术课程的不同 PPT",
+            "expected_kind": "text",
+        }]
+        self.assertEqual(
+            semantic_vision_frame_budget(
+                selected, requests, max_frames=60, duration=1200
+            ),
+            40,
+        )
+
+    def test_candidate_times_keeps_multiple_scene_changes_in_one_requested_range(self):
+        times = candidate_times(
+            scenes=[10, 12, 14, 16],
+            segments=[Segment("s1", 9, 17, "这里依次展示四页 PPT")],
+            duration=60,
+            max_frames=20,
+            visual_requests=[{
+                "time_start": 9,
+                "time_end": 17,
+                "purpose": "读取所有不同幻灯片",
+                "expected_kind": "text",
+            }],
+        )
+        requested_scene_times = [at for at, score in times if score >= 7]
+        self.assertGreaterEqual(len(requested_scene_times), 4)
+
+    def test_multiple_distinct_complex_frames_can_follow_one_paragraph(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            assets = root / "assets"
+            assets.mkdir()
+            first = assets / "architecture.png"
+            second = assets / "flowchart.png"
+            first.write_bytes(b"one")
+            second.write_bytes(b"two")
+            paragraphs = [Paragraph(["s1"], "这一段依次解释架构图和流程图。", 0, 20)]
+            frames = [
+                Frame(5, str(first), ["s1"], paragraph_index=0, content_kind="diagram", ahash="0" * 64),
+                Frame(15, str(second), ["s1"], paragraph_index=0, content_kind="process", ahash="f" * 64),
+            ]
+            groups = plan_frame_evidence_groups(paragraphs, frames)
+            self.assertEqual(groups[0], frames)
+            note = root / "note.md"
+            compose_markdown(
+                note,
+                {"title": "多图", "url": "https://example.invalid", "part": 1},
+                paragraphs,
+                frames,
+            )
+            rendered = note.read_text(encoding="utf-8")
+            self.assertIn("architecture.png", rendered)
+            self.assertIn("flowchart.png", rendered)
+            self.assertLess(rendered.index("架构图和流程图"), rendered.index("architecture.png"))
+
+    def test_multiple_complete_text_slides_merge_as_copyable_notes_without_images(self):
+        paragraphs = [Paragraph(["s1"], "作者依次展示两页名单。", 0, 20)]
+        frames = [
+            Frame(5, "/tmp/a.png", ["s1"], paragraph_index=0, keep_image=False, extracted_markdown="- A\n- B", ahash="0" * 64),
+            Frame(15, "/tmp/b.png", ["s1"], paragraph_index=0, keep_image=False, extracted_markdown="- C\n- D", ahash="f" * 64),
+        ]
+        groups = plan_frame_evidence_groups(paragraphs, frames)
+        self.assertEqual(len(groups[0]), 2)
+        self.assertEqual(paragraphs[0].visual_note, "- A\n- B\n\n- C\n- D")
+
+    def test_markdown_uses_relative_assets(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            assets = root / "assets"
+            assets.mkdir()
+            image = assets / "001.png"
+            image.write_bytes(b"png")
+            note = root / "note.md"
+            compose_markdown(
+                note,
+                {"title": "标题", "url": "https://example.invalid", "part": 1},
+                [Paragraph(["s1"], "正文", 0, 2)],
+                [Frame(1, str(image), ["s1"], paragraph_index=0, vision_description="与正文相关的界面", extracted_markdown="界面")],
+            )
+            rendered = note.read_text(encoding="utf-8")
+            self.assertIn("(assets/001.png)", rendered)
+            self.assertIn("正文", rendered)
+            self.assertLess(rendered.index("正文"), rendered.index("(assets/001.png)"))
+            self.assertNotIn("补充画面", rendered)
+
+    def test_golden_layout_uses_text_for_complete_list_and_inline_image_for_dense_prompt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            assets = root / "assets"
+            assets.mkdir()
+            simple = assets / "podcast-list.png"
+            dense = assets / "automation-prompt.png"
+            simple.write_bytes(b"simple")
+            dense.write_bytes(b"dense")
+            paragraphs = [
+                Paragraph(
+                    ["s1"],
+                    "作者列出了自己喜欢的 AI 播客。",
+                    0,
+                    4,
+                    visual_note="十字路口 Crossing、硅谷 101、OnBoard!。",
+                ),
+                Paragraph(
+                    ["s2"],
+                    "作者展示了每天抓取最近 24 小时 AI 新闻的 Automation 提示词。",
+                    4,
+                    8,
+                    visual_note="画面还能确认新闻来源、关键词和分栏数量设置。",
+                ),
+            ]
+            frames = [
+                Frame(
+                    2,
+                    str(simple),
+                    ["s1"],
+                    paragraph_index=0,
+                    content_kind="list",
+                    keep_image=False,
+                    evidence_confidence="high",
+                    evidence_completeness="complete",
+                    information_density="low",
+                ),
+                Frame(
+                    6,
+                    str(dense),
+                    ["s2"],
+                    paragraph_index=1,
+                    content_kind="ui",
+                    keep_image=True,
+                    evidence_confidence="high",
+                    evidence_completeness="partial",
+                    information_density="high",
+                ),
+            ]
+            note = root / "note.md"
+            compose_markdown(
+                note,
+                {"title": "黄金布局", "url": "https://example.invalid", "part": 1},
+                paragraphs,
+                frames,
+            )
+            rendered = note.read_text(encoding="utf-8")
+            self.assertIn("十字路口 Crossing、硅谷 101、OnBoard!", rendered)
+            self.assertNotIn("podcast-list.png", rendered)
+            self.assertIn("automation-prompt.png", rendered)
+            self.assertLess(
+                rendered.index("Automation 提示词"),
+                rendered.index("automation-prompt.png"),
+            )
+            self.assertEqual(rendered.count("!["), 1)
+
+    def test_markdown_labels_visual_only_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            assets = root / "assets"
+            assets.mkdir()
+            image = assets / "001.png"
+            image.write_bytes(b"png")
+            note = root / "note.md"
+            compose_markdown(
+                note,
+                {"title": "标题", "url": "https://example.invalid", "part": 1},
+                [Paragraph(["s1"], "口述正文。", 0, 2, visual_note="画面显示完整单集标题。")],
+                [Frame(1, str(image), ["s1"], paragraph_index=0, vision_description="完整单集标题", extracted_markdown="完整单集标题")],
+            )
+            rendered = note.read_text(encoding="utf-8")
+            self.assertIn("[!info] 画面补充", rendered)
+            self.assertLess(rendered.index("口述正文"), rendered.index("画面补充"))
+            self.assertLess(rendered.index("画面补充"), rendered.index("assets/001.png"))
+
+    def test_uncertain_vision_description_is_not_used_as_image_alt_text(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            assets = root / "assets"
+            assets.mkdir()
+            image = assets / "001.png"
+            image.write_bytes(b"png")
+            note = root / "note.md"
+            compose_markdown(
+                note,
+                {"title": "标题", "url": "https://example.invalid", "part": 1},
+                [Paragraph(["s1"], "口述正文。", 0, 2)],
+                [Frame(
+                    1,
+                    str(image),
+                    ["s1"],
+                    paragraph_index=0,
+                    content_kind="ui",
+                    vision_description="画面疑似显示错误的韩文网站名称。",
+                    evidence_confidence="medium",
+                )],
+            )
+            rendered = note.read_text(encoding="utf-8")
+            self.assertNotIn("韩文网站名称", rendered)
+            self.assertIn("![ui 00m01s]", rendered)
+
+    def test_copyable_text_replaces_redundant_image(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            assets = root / "assets"
+            assets.mkdir()
+            image = assets / "001.png"
+            image.write_bytes(b"png")
+            note = root / "note.md"
+            paragraph = Paragraph(["s1"], "口述正文。", 0, 2, visual_note="- 节目 A\n- 节目 B")
+            frame = Frame(1, str(image), ["s1"], paragraph_index=0, content_kind="list", keep_image=False)
+            compose_markdown(
+                note,
+                {"title": "标题", "url": "https://example.invalid", "part": 1},
+                [paragraph],
+                [frame],
+            )
+            rendered = note.read_text(encoding="utf-8")
+            self.assertIn("节目 A", rendered)
+            self.assertNotIn("assets/001.png", rendered)
+            self.assertFalse(image.exists())
+
+    def test_uncertain_formula_keeps_original_image(self):
+        paragraphs = [Paragraph(["s1"], "公式推导。", 0, 4)]
+        frames = [Frame(2, "/tmp/formula.png", ["s1"], ocr_text="E = mc2")]
+        client = FakeClient({
+            "relevance": "high",
+            "content_kind": "formula",
+            "visual_note": "$$E=mc^2$$",
+            "keep_image": False,
+            "confidence": "low",
+        })
+        enrich_with_visual_evidence(paragraphs, frames, client)
+        self.assertTrue(frames[0].keep_image)
+
+    def test_delete_is_soft_and_restore_uses_stable_history_id(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"VTM_STATE_DIR": str(Path(temp) / "state")}
+        ):
+            vault = Path(temp) / "vault"
+            job = vault / "Sources" / "Videos" / "2026" / "2026-07" / "demo [BV11JNn6mESN-p1]"
+            job.mkdir(parents=True)
+            note = job / "demo.md"
+            note.write_text("正文", encoding="utf-8")
+            task = reserve_task(vault, url="u", bvid="BV11JNn6mESN")
+            update_task(vault, task["task_key"], status="complete", job_dir=str(job), note=str(note))
+            deleted = delete_job(vault, str(task["id"]))
+            self.assertFalse(job.exists())
+            self.assertEqual(deleted["status"], "deleted")
+            restored = restore_job(vault, task["task_key"])
+            self.assertTrue(job.exists())
+            self.assertEqual(restored["task_key"], task["task_key"])
+
+    def test_failed_record_without_note_can_be_soft_deleted_and_restored(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"VTM_STATE_DIR": str(Path(temp) / "state")}
+        ):
+            vault = Path(temp) / "vault"
+            task = reserve_task(vault, url="u", bvid="BV1failed")
+            source = Path(temp) / "state" / "tasks" / str(task["task_key"])
+            source.mkdir(parents=True)
+            (source / "job.json").write_text('{"status":"failed"}', encoding="utf-8")
+            update_task(vault, task["task_key"], status="failed", error="quality gate")
+
+            deleted = delete_job(vault, str(task["id"]))
+            self.assertTrue(deleted["record_only"])
+            self.assertFalse(source.exists())
+            self.assertEqual(list_tasks(vault), [])
+
+            restored = restore_job(vault, task["task_key"])
+            self.assertTrue(restored["record_only"])
+            self.assertEqual(restored["status"], "failed")
+            self.assertTrue(source.is_dir())
+
+    def test_restore_rejects_a_destination_outside_the_vault(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"VTM_STATE_DIR": str(Path(temp) / "state")}
+        ):
+            root = Path(temp)
+            vault = root / "vault"
+            job = vault / "Sources" / "Videos" / "demo"
+            job.mkdir(parents=True)
+            note = job / "demo.md"
+            note.write_text("正文", encoding="utf-8")
+            task = reserve_task(vault, url="u", bvid="BV1restore")
+            update_task(vault, task["task_key"], status="complete", job_dir=str(job), note=str(note))
+            delete_job(vault, str(task["id"]))
+            update_task(vault, task["task_key"], job_dir=str(root / "outside"))
+
+            with self.assertRaisesRegex(RuntimeError, "不在 Obsidian Vault"):
+                restore_job(vault, task["task_key"])
+
+    def test_no_visual_pipeline_writes_auditable_note(self):
+        info = VideoInfo(
+            url="https://www.bilibili.com/video/BV1ab411c7DE",
+            bvid="BV1ab411c7DE",
+            cid=42,
+            part=1,
+            title="测试视频",
+            part_title="测试视频",
+            duration=12,
+            owner="测试作者",
+            cover="",
+        )
+
+        class FakeBilibili:
+            def __init__(self):
+                pass
+
+            def inspect(self, url, part):
+                return info
+
+            def subtitles(self, inspected):
+                return [Segment("s000001", 0, 2, "嗯，完整内容。")], {
+                    "source": "bilibili_subtitle"
+                }
+
+        editor = SequenceClient(direct_manuscript_responses())
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"VTM_STATE_DIR": str(Path(temp) / "state")}
+        ), patch(
+            "vtm_core.pipeline.BilibiliClient", FakeBilibili
+        ), patch("vtm_core.pipeline.text_client", return_value=editor):
+            progress = []
+            result = run(
+                Options(
+                    url=info.url,
+                    vault=Path(temp),
+                    no_visual=True,
+                    progress=progress.append,
+                    task_key="20260716-1",
+                    task_date="2026-07-16",
+                )
+            )
+            note = Path(result["note"])
+            self.assertTrue(note.exists())
+            coverage = json.loads((Path(temp) / "state" / "tasks" / "20260716-1" / "coverage.json").read_text())
+            self.assertEqual(
+                coverage["editing_architecture"],
+                "whole_transcript_plan_visual_reconcile_write_restore_copyedit",
+            )
+            self.assertEqual(coverage["llm_document_passes"], 4)
+            self.assertFalse((Path(temp) / "state" / "tasks" / "20260716-1" / "information-units.json").exists())
+            self.assertEqual(result["transcript_source"], "bilibili_subtitle")
+            self.assertEqual(result["bvid"], "BV1ab411c7DE")
+            self.assertEqual(progress[0], "正在读取视频信息。")
+            self.assertIn("正在提取并匹配关键画面。", progress)
+            self.assertEqual(progress[-1], "处理完成。")
+
+    def test_failure_after_indexing_rolls_back_note_assets_and_index_rows(self):
+        info = VideoInfo(
+            url="https://www.bilibili.com/video/BV1ab411c7DE",
+            bvid="BV1ab411c7DE",
+            cid=42,
+            part=1,
+            title="回滚测试",
+            part_title="回滚测试",
+            duration=12,
+            owner="测试作者",
+            cover="",
+        )
+
+        class FakeBilibili:
+            def inspect(self, url, part):
+                return info
+
+            def subtitles(self, inspected):
+                return [Segment("s000001", 0, 2, "必须保留的完整内容。")], {
+                    "source": "bilibili_subtitle"
+                }
+
+        editor = SequenceClient(
+            direct_manuscript_responses("必须保留的完整内容。")
+        )
+
+        def fail_after_publication(message):
+            if message == "处理完成。":
+                raise RuntimeError("completion delivery failed")
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"VTM_STATE_DIR": str(Path(temp) / "state")}
+        ), patch("vtm_core.pipeline.BilibiliClient", FakeBilibili), patch(
+            "vtm_core.pipeline.text_client", return_value=editor
+        ):
+            vault = Path(temp) / "vault"
+            with self.assertRaisesRegex(RuntimeError, "completion delivery failed"):
+                run(
+                    Options(
+                        url=info.url,
+                        vault=vault,
+                        no_visual=True,
+                        progress=fail_after_publication,
+                        task_key="20260716-1",
+                        task_date="2026-07-16",
+                    )
+                )
+            self.assertFalse(any((vault / "Sources").rglob("*.md")))
+            index_text = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in (vault / "Indexes").rglob("*.md")
+            )
+            self.assertNotIn("20260716-1", index_text)
+
+    def test_no_subtitle_downloads_audio_only_before_asr(self):
+        info = VideoInfo(
+            url="https://www.bilibili.com/video/BV1ab411c7DE",
+            bvid="BV1ab411c7DE",
+            cid=42,
+            part=1,
+            title="无字幕视频",
+            part_title="无字幕视频",
+            duration=12,
+            owner="测试作者",
+            cover="",
+        )
+
+        class FakeBilibili:
+            def __init__(self):
+                pass
+
+            def inspect(self, url, part):
+                return info
+
+            def subtitles(self, inspected):
+                return [], {"warning": "none"}
+
+            def ai_transcript(self, inspected):
+                return [], {"warning": "none"}
+
+        calls = []
+
+        def fake_download(url, work_dir, **kwargs):
+            calls.append(kwargs)
+            path = work_dir / "audio.m4s"
+            path.write_bytes(b"audio")
+            return path
+
+        editor = SequenceClient(direct_manuscript_responses())
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"VTM_STATE_DIR": str(Path(temp) / "state")}
+        ), patch(
+            "vtm_core.pipeline.BilibiliClient", FakeBilibili
+        ), patch("vtm_core.pipeline.download_media", side_effect=fake_download), patch(
+            "vtm_core.pipeline.transcribe",
+            return_value=([Segment("s000001", 0, 2, "完整内容。")], {"source": "funasr_paraformer"}),
+        ), patch("vtm_core.pipeline.text_client", return_value=editor):
+            result = run(Options(url=info.url, vault=Path(temp), no_visual=True, task_key="20260716-1", task_date="2026-07-16"))
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0]["audio_only"])
+        self.assertEqual(result["transcript_source"], "funasr_paraformer")
+
+    def test_temporary_media_is_removed_when_asr_fails(self):
+        info = VideoInfo(
+            url="https://www.bilibili.com/video/BV1ab411c7DE",
+            bvid="BV1ab411c7DE",
+            cid=42,
+            part=1,
+            title="失败清理测试",
+            part_title="失败清理测试",
+            duration=12,
+            owner="测试作者",
+            cover="",
+        )
+
+        class FakeBilibili:
+            def __init__(self):
+                pass
+
+            def inspect(self, url, part):
+                return info
+
+            def subtitles(self, inspected):
+                return [], {"warning": "none"}
+
+            def ai_transcript(self, inspected):
+                return [], {"warning": "none"}
+
+        def fake_download(url, work_dir, **kwargs):
+            path = work_dir / "audio.m4s"
+            path.write_bytes(b"temporary audio")
+            return path
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"VTM_STATE_DIR": str(Path(temp) / "state")}
+        ), patch("vtm_core.pipeline.BilibiliClient", FakeBilibili), patch(
+            "vtm_core.pipeline.download_media", side_effect=fake_download
+        ), patch(
+            "vtm_core.pipeline.transcribe", side_effect=RuntimeError("ASR failed")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "ASR failed"):
+                run(
+                    Options(
+                        url=info.url,
+                        vault=Path(temp) / "vault",
+                        no_visual=True,
+                        task_key="20260716-1",
+                        task_date="2026-07-16",
+                    )
+                )
+            self.assertFalse((Path(temp) / "state" / "work" / "20260716-1").exists())
+
+    def test_interrupted_job_is_cancelled_and_temporary_media_is_removed(self):
+        info = VideoInfo(
+            url="https://www.bilibili.com/video/BV1ab411c7DE",
+            bvid="BV1ab411c7DE",
+            cid=42,
+            part=1,
+            title="中止清理测试",
+            part_title="中止清理测试",
+            duration=12,
+            owner="测试作者",
+            cover="",
+        )
+
+        class FakeBilibili:
+            def inspect(self, url, part):
+                return info
+
+            def subtitles(self, inspected):
+                return [], {"warning": "none"}
+
+            def ai_transcript(self, inspected):
+                return [], {"warning": "none"}
+
+        def fake_download(url, work_dir, **kwargs):
+            path = work_dir / "audio.m4s"
+            path.write_bytes(b"temporary audio")
+            return path
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"VTM_STATE_DIR": str(Path(temp) / "state")}
+        ), patch("vtm_core.pipeline.BilibiliClient", FakeBilibili), patch(
+            "vtm_core.pipeline.download_media", side_effect=fake_download
+        ), patch("vtm_core.pipeline.transcribe", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                run(
+                    Options(
+                        url=info.url,
+                        vault=Path(temp) / "vault",
+                        no_visual=True,
+                        task_key="20260716-1",
+                        task_date="2026-07-16",
+                    )
+                )
+
+            job = json.loads(
+                (Path(temp) / "state" / "tasks" / "20260716-1" / "job.json").read_text()
+            )
+            self.assertEqual(job["status"], "cancelled")
+            self.assertFalse((Path(temp) / "state" / "work" / "20260716-1").exists())
+            self.assertFalse(any((Path(temp) / "vault").rglob("*.md")))
+
+    def test_cancel_latest_running_reconciles_an_old_interrupted_task(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ,
+            {"VTM_STATE_DIR": str(Path(temp) / "state"), "VTM_TIMEZONE": "Asia/Shanghai"},
+        ):
+            vault = Path(temp) / "vault"
+            task = reserve_task(vault, url="https://bilibili.com/video/BV1old", bvid="BV1old")
+            work = Path(temp) / "state" / "work" / str(task["task_key"])
+            work.mkdir(parents=True)
+            (work / "audio.m4s").write_bytes(b"temporary")
+            incomplete = (
+                vault
+                / "Sources"
+                / "Videos"
+                / "2026"
+                / "2026-07"
+                / f"{task['task_key']}-unfinished"
+            )
+            incomplete.mkdir(parents=True)
+            (incomplete / "partial.txt").write_text("partial", encoding="utf-8")
+            indexes = vault / "Indexes"
+            indexes.mkdir(parents=True)
+            (indexes / "Videos.md").write_text(
+                f"# 视频笔记\n\n- [[note|title]] · `{task['task_key']}`\n",
+                encoding="utf-8",
+            )
+
+            result = cancel_job(vault, latest_running=True)
+
+            self.assertEqual(result["status"], "cancelled")
+            self.assertFalse(work.exists())
+            self.assertFalse(incomplete.exists())
+            self.assertNotIn(
+                str(task["task_key"]),
+                (indexes / "Videos.md").read_text(encoding="utf-8"),
+            )
+            rows = list_tasks(vault, all_tasks=True)
+            self.assertEqual(rows[0]["status"], "cancelled")
+
+    def test_cancel_latest_running_selects_the_most_recent_task(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ,
+            {"VTM_STATE_DIR": str(Path(temp) / "state"), "VTM_TIMEZONE": "Asia/Shanghai"},
+        ):
+            vault = Path(temp) / "vault"
+            first = reserve_task(vault, url="u1", bvid="BV1first")
+            second = reserve_task(vault, url="u2", bvid="BV1second")
+
+            result = cancel_job(vault, latest_running=True)
+
+            self.assertEqual(result["task_key"], second["task_key"])
+            self.assertEqual(get_task(vault, first["task_key"])["status"], "running")
+            self.assertEqual(get_task(vault, second["task_key"])["status"], "cancelled")
+
+    def test_task_registry_persists_queue_pid_and_stage(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ,
+            {"VTM_STATE_DIR": str(Path(temp) / "state"), "VTM_TIMEZONE": "Asia/Shanghai"},
+        ):
+            vault = Path(temp) / "vault"
+            task = reserve_task(
+                vault,
+                url="https://bilibili.com/video/BV1queued",
+                bvid="BV1queued",
+                status="queued",
+            )
+            updated = update_task(
+                vault,
+                task["task_key"],
+                pid=43210,
+                stage=3,
+                stage_message="正在清理和重排完整文字稿。",
+            )
+
+            self.assertEqual(updated["status"], "queued")
+            self.assertEqual(updated["pid"], 43210)
+            self.assertEqual(updated["stage"], 3)
+            self.assertEqual(updated["stage_message"], "正在清理和重排完整文字稿。")
+
+    def test_submit_detaches_the_worker_and_rewrites_command_to_run(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"VTM_STATE_DIR": str(Path(temp) / "state")}
+        ), patch("video_manuscript.subprocess.Popen") as popen:
+            popen.return_value.pid = 24680
+
+            result = submit_detached(
+                [
+                    "submit",
+                    "--url",
+                    "https://www.bilibili.com/video/BV1detached/",
+                    "--gateway-output",
+                    "--progress-target",
+                    "feishu",
+                ]
+            )
+
+            command = popen.call_args.args[0]
+            self.assertEqual(Path(command[0]).name, "vtm")
+            self.assertEqual(command[1], "run")
+            self.assertNotIn("submit", command[1:])
+            self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            self.assertEqual(result["status"], "submitted")
+            self.assertTrue(result["chat_session_released"])
+
+    def test_bulk_delete_uses_stable_plan_and_protects_active_jobs(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ,
+            {"VTM_STATE_DIR": str(Path(temp) / "state"), "VTM_TIMEZONE": "Asia/Shanghai"},
+        ):
+            vault = Path(temp) / "vault"
+            keep = reserve_task(vault, url="keep", bvid="BV1keep")
+            update_task(vault, keep["task_key"], status="failed", error="old")
+            remove_one = reserve_task(vault, url="remove1", bvid="BV1remove1")
+            update_task(vault, remove_one["task_key"], status="failed", error="old")
+            remove_two = reserve_task(vault, url="remove2", bvid="BV1remove2")
+            update_task(vault, remove_two["task_key"], status="cancelled", error="old")
+            active = reserve_task(
+                vault,
+                url="active",
+                bvid="BV1active",
+                status="queued",
+            )
+
+            plan = plan_bulk_delete(
+                vault,
+                keep=[str(keep["task_key"])],
+                all_history=True,
+            )
+
+            self.assertEqual(plan["status"], "confirmation_required")
+            self.assertEqual(plan["delete_count"], 2)
+            self.assertEqual(plan["active_protected"], [active["task_key"]])
+
+            messages = []
+            with patch(
+                "video_manuscript.send_hermes_progress",
+                side_effect=lambda target, message: messages.append((target, message)),
+            ):
+                result = confirm_bulk_delete(
+                    vault,
+                    str(plan["confirmation_token"]),
+                    send_target="feishu",
+                )
+
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(result["deleted_count"], 2)
+            self.assertEqual(get_task(vault, keep["task_key"])["status"], "failed")
+            self.assertEqual(get_task(vault, active["task_key"])["status"], "queued")
+            self.assertTrue(get_task(vault, remove_one["task_key"], include_deleted=True)["deleted_at"])
+            self.assertTrue(get_task(vault, remove_two["task_key"], include_deleted=True)["deleted_at"])
+            self.assertIn("[RUNNING]", messages[0][1])
+            self.assertIn("[COMPLETE]", messages[-1][1])
+
+
+if __name__ == "__main__":
+    unittest.main()

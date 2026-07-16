@@ -1,0 +1,5 @@
+# Mainland-friendly CPU ASR. Install during deployment, not while processing a video.
+torch
+torchaudio
+funasr>=1.3.0
+modelscope

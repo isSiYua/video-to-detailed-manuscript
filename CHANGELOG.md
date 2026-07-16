@@ -1,0 +1,16 @@
+# Changelog
+
+## 1.0.0 — first public Bilibili release
+
+This release freezes the Bilibili manuscript pipeline after acceptance testing with multiple real videos.
+
+- Produces structured, detail-preserving edited manuscripts instead of summaries or raw subtitles.
+- Uses complete-transcript planning, golden-style writing, detail restoration, and final concise copyediting.
+- Reconciles bounded ASR/terminology suspects without turning mechanical checks into the writer.
+- Plans visual evidence from transcript semantics, locally detects and deduplicates candidate frames, and limits paid vision calls.
+- Converts complete simple text evidence to Markdown while retaining dense prompts, diagrams, paper figures, complex interfaces, and partial OCR as inline images.
+- Re-captures retained images from the highest available stream up to the requested 1080p.
+- Runs detached background jobs with two-worker queuing, per-task six-stage progress, cancellation, one-shot Feishu ZIP delivery, soft deletion, recovery, and media cleanup.
+- Keeps credentials, operational state, Vault content, exports, source media, and model weights outside the repository.
+
+Future source adapters must preserve this release's Bilibili output and reuse the common manuscript core.
