@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.0 — deployment packaging
+
+- Adds a dry-run-capable Debian/Ubuntu installer for Hermes, Codex, and explicit Agent Skill directories.
+- Installs the CPU runtime and delegates all model preparation to the existing deterministic `prepare-asr` command.
+- Documents the exact Paraformer, FSMN-VAD, and CT-Punctuation ModelScope IDs and official model cards.
+- Does not change the frozen manuscript, visual, task, or storage pipeline.
+
 ## 1.0.0 — first public Bilibili release
 
 This release freezes the Bilibili manuscript pipeline after acceptance testing with multiple real videos.

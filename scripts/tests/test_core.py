@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -225,6 +226,44 @@ def audit_repair(section_statuses: dict[str, str], issues: list[dict]) -> dict:
 
 
 class CoreTests(unittest.TestCase):
+    def test_repository_installer_dry_run_is_safe_and_external_to_skill_contract(self):
+        root = Path(__file__).resolve().parents[2]
+        installer = root / "install.sh"
+        self.assertTrue(installer.is_file())
+        skill_before = (root / "SKILL.md").read_bytes()
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "agent-skills" / "video-to-detailed-manuscript"
+            completed = subprocess.run(
+                [
+                    "sh",
+                    str(installer),
+                    "--skill-dir",
+                    str(target),
+                    "--skip-system-packages",
+                    "--minimal",
+                    "--dry-run",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("requirements.txt", completed.stdout)
+            self.assertIn("ln -s", completed.stdout)
+            self.assertIn("scripts/vtm doctor", completed.stdout)
+            self.assertFalse(target.exists())
+        self.assertEqual((root / "SKILL.md").read_bytes(), skill_before)
+
+    def test_deployment_document_lists_exact_prepared_model_ids(self):
+        root = Path(__file__).resolve().parents[2]
+        deployment = (root / "DEPLOYMENT.md").read_text(encoding="utf-8")
+        from vtm_core.asr import FUNASR_MODEL, FUNASR_PUNC_MODEL, FUNASR_VAD_MODEL
+
+        self.assertIn(FUNASR_MODEL, deployment)
+        self.assertIn(FUNASR_VAD_MODEL, deployment)
+        self.assertIn(FUNASR_PUNC_MODEL, deployment)
+
     def test_deterministic_contract_exposes_the_non_negotiable_rules(self):
         payload = contract()
         self.assertEqual(payload["pipeline_version"], PIPELINE_VERSION)

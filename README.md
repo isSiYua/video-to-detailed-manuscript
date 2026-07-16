@@ -32,22 +32,23 @@
 
 ## 快速开始
 
-运行环境：Python 3.10+、`ffmpeg`、`ffprobe`；无字幕视频推荐预先安装 FunASR。
+在 Debian/Ubuntu 服务器上，克隆仓库后运行一键安装器：
 
 ```bash
-python3 -m pip install -r scripts/requirements.txt
-scripts/vtm doctor
-scripts/vtm run --url 'https://www.bilibili.com/video/BV.../'
+git clone https://github.com/isSiYua/video-to-detailed-manuscript.git
+cd video-to-detailed-manuscript
+./install.sh --agent hermes
 ```
 
-中国大陆 CPU 服务器需要本地 ASR 时：
+Codex 使用 `--agent codex`；其他 Agent 使用 `--skill-dir` 指定其 Skill 目录。安装器会安装 `ffmpeg`、Python 依赖和 CPU 版 FunASR，准备三个固定的 ModelScope 模型，建立 Skill 链接并运行 `doctor`。它不会安装 Agent、配置飞书或写入任何密钥。
+
+如果只处理已有字幕的视频，可以跳过较大的本地 ASR：
 
 ```bash
-python3 -m pip install -r scripts/requirements-asr-cn.txt
-scripts/vtm prepare-asr
+./install.sh --agent hermes --minimal
 ```
 
-详细部署、环境变量和模型切换见 [references/configuration.md](references/configuration.md)。
+完整安装选项、三个 FunASR 模型的准确 ID 与官方链接见 [DEPLOYMENT.md](DEPLOYMENT.md)。环境变量和模型切换见 [references/configuration.md](references/configuration.md)。
 
 ## 模型配置
 
