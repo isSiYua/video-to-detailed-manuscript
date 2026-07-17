@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Callable
 
@@ -309,14 +310,74 @@ def _require_final_copyedit(
         )
 
 
+_ANCHOR_PUNCTUATION = str.maketrans(
+    {
+        "、": ",",
+        "，": ",",
+        "。": ".",
+        "；": ";",
+        "：": ":",
+        "（": "(",
+        "）": ")",
+        "【": "[",
+        "】": "]",
+    }
+)
+
+
+def _anchor_comparison(value: Any) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    normalized = normalized.translate(_ANCHOR_PUNCTUATION).casefold()
+    return re.sub(r"\s+", "", normalized)
+
+
+def _anchor_from_replacement(anchor: str, replacement: str) -> str:
+    """Return the replacement's spelling for an equivalent minimal anchor."""
+
+    needle = _anchor_comparison(anchor)
+    if not needle:
+        return ""
+    rendered: list[str] = []
+    positions: list[int] = []
+    for index, character in enumerate(replacement):
+        normalized = unicodedata.normalize("NFKC", character)
+        normalized = normalized.translate(_ANCHOR_PUNCTUATION).casefold()
+        for item in normalized:
+            if item.isspace():
+                continue
+            rendered.append(item)
+            positions.append(index)
+    offset = "".join(rendered).find(needle)
+    if offset < 0:
+        return ""
+    return replacement[positions[offset] : positions[offset + len(needle) - 1] + 1].strip()
+
+
+def _anchor_is_present(rendered: str, anchor: Any) -> bool:
+    needle = _anchor_comparison(anchor)
+    if not needle:
+        return False
+    if needle in rendered:
+        return True
+    # Final copyediting may naturally insert a neutral Chinese distributor,
+    # for example “参数为零” -> “参数也为零”.  Permit only this bounded class;
+    # polarity-bearing anchors still require their explicit source direction.
+    if any(marker in needle for marker in ("不", "无", "未", "非", "没有")):
+        return False
+    pattern = ""
+    previous = ""
+    for character in needle:
+        if previous and "\u3400" <= previous <= "\u9fff" and "\u3400" <= character <= "\u9fff":
+            pattern += "[也均都]*"
+        pattern += re.escape(character)
+        previous = character
+    return re.search(pattern, rendered) is not None
+
+
 def _require_reconciliation_applied(
     candidate: dict[str, Any], reconciliation: dict[str, Any]
 ) -> None:
-    rendered = re.sub(
-        r"\s+",
-        "",
-        json.dumps(candidate, ensure_ascii=False),
-    ).lower()
+    rendered = _anchor_comparison(json.dumps(candidate, ensure_ascii=False))
     for correction in reconciliation.get("corrections", []):
         if not isinstance(correction, dict):
             continue
@@ -326,7 +387,7 @@ def _require_reconciliation_applied(
         missing = [
             str(anchor)
             for anchor in anchors
-            if re.sub(r"\s+", "", str(anchor)).lower() not in rendered
+            if not _anchor_is_present(rendered, anchor)
         ]
         if missing:
             raise ValueError(f"最终稿未落实已核验修复锚点：{', '.join(missing)}")
@@ -785,7 +846,7 @@ def _call_asr_reconciliation(
                 if confidence not in {"high", "medium"} or basis not in {
                     "visible_text", "adjacent_context"
                 }:
-                    raise ValueError("correct action requires supported confidence and basis")
+                    continue
                 if basis == "adjacent_context":
                     if not re.search(
                         r"(?:不|没有|不存在|而不是|只|但|相反|可能|漂移|问题)",
@@ -797,18 +858,23 @@ def _call_asr_reconciliation(
                         continue
                     confidence = "medium"
                 if not (1 <= len(replacement) <= 160):
-                    raise ValueError("replacement length is invalid")
+                    continue
                 required_anchors = result.get("required_anchors")
                 if not isinstance(required_anchors, list) or not 1 <= len(required_anchors) <= 4:
-                    raise ValueError("correct action requires 1-4 required_anchors")
-                required_anchors = [str(anchor).strip() for anchor in required_anchors]
-                if any(
-                    not 2 <= len(anchor) <= 40
-                    or re.sub(r"\s+", "", anchor).lower()
-                    not in re.sub(r"\s+", "", replacement).lower()
+                    continue
+                replacement_anchors = [
+                    _anchor_from_replacement(str(anchor).strip(), replacement)
                     for anchor in required_anchors
+                    if 2 <= len(str(anchor).strip()) <= 40
+                ]
+                if len(replacement_anchors) != len(required_anchors) or any(
+                    not anchor or len(anchor) > 40 for anchor in replacement_anchors
                 ):
-                    raise ValueError("required_anchors must be minimal substrings of replacement")
+                    # One unsupported optional correction must not block the
+                    # complete manuscript.  Treat it as unresolved and let the
+                    # full-document passes use the original evidence.
+                    continue
+                required_anchors = replacement_anchors
                 negative_markers = [
                     marker
                     for marker in ("不存在", "没有", "并非", "不是", "而不是", "不能", "不会")
@@ -818,7 +884,7 @@ def _call_asr_reconciliation(
                     any(marker in anchor for marker in negative_markers)
                     for anchor in required_anchors
                 ):
-                    raise ValueError("negative correction requires a polarity anchor")
+                    continue
                 if basis == "visible_text":
                     visible_replacement = re.sub(r"\s+", "", replacement).lower()
                     if visible_replacement not in visible_corpus:

@@ -34,6 +34,7 @@ from vtm_core.direct_manuscript import (
     _call_asr_reconciliation,
     _paragraphs_from_document,
     _require_final_copyedit,
+    _require_reconciliation_applied,
     _verified_visual_clues,
     complete_direct_manuscript,
     create_direct_plan,
@@ -756,6 +757,89 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(
             result["corrections"][0]["replacement"], "agentic search"
         )
+
+    def test_reconciliation_accepts_equivalent_yolo_anchor_punctuation(self):
+        source_text = "C1C2C3代表类别，比如可能是person、car和traffic light。"
+        client = SequenceClient([{
+            "items": [{
+                "item_id": "r001",
+                "action": "correct",
+                "replacement": "C1、C2、C3代表类别，bh＝0.7，bw＝0.25",
+                "required_anchors": ["C1,C2,C3", "bh=0.7,bw=0.25"],
+                "confidence": "medium",
+                "basis": "adjacent_context",
+            }],
+        }])
+        result = _call_asr_reconciliation(
+            client,
+            segments=[Segment("s000001", 0, 2, source_text)],
+            plan={"sections": []},
+            visual_evidence=[],
+            suspect_contexts=[{
+                "source_ids": ["s000001"],
+                "context": source_text,
+                "asr_suspects": [{
+                    "source_text": source_text,
+                    "conservative_repair": None,
+                    "confidence": "medium",
+                }],
+            }],
+        )
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(
+            result["corrections"][0]["required_anchors"],
+            ["C1、C2、C3", "bh＝0.7，bw＝0.25"],
+        )
+        _require_reconciliation_applied(
+            {"sections": [{"paragraphs": [{
+                "text": "类别采用 C1,C2,C3；其中 bh=0.7，bw=0.25。"
+            }]}]},
+            result,
+        )
+
+    def test_reconciliation_allows_neutral_particle_but_not_polarity_change(self):
+        reconciliation = {"corrections": [{
+            "required_anchors": ["参数为零"],
+        }]}
+        _require_reconciliation_applied(
+            {"sections": [{"paragraphs": [{"text": "第2、3个格子的参数也为零。"}]}]},
+            reconciliation,
+        )
+        with self.assertRaisesRegex(ValueError, "参数为零"):
+            _require_reconciliation_applied(
+                {"sections": [{"paragraphs": [{"text": "第2、3个格子的参数不为零。"}]}]},
+                reconciliation,
+            )
+
+    def test_reconciliation_drops_one_unsupported_anchor_instead_of_failing_document(self):
+        source_text = "这个类别可能是car。"
+        client = SequenceClient([{
+            "items": [{
+                "item_id": "r001",
+                "action": "correct",
+                "replacement": "该类别是 car",
+                "required_anchors": ["traffic light"],
+                "confidence": "medium",
+                "basis": "adjacent_context",
+            }],
+        }])
+        result = _call_asr_reconciliation(
+            client,
+            segments=[Segment("s000001", 0, 2, source_text)],
+            plan={"sections": []},
+            visual_evidence=[],
+            suspect_contexts=[{
+                "source_ids": ["s000001"],
+                "context": source_text,
+                "asr_suspects": [{
+                    "source_text": source_text,
+                    "conservative_repair": None,
+                    "confidence": "medium",
+                }],
+            }],
+        )
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(result, {"corrections": []})
 
     def test_asr_suspect_deterministically_adds_visual_request(self):
         segments = [
