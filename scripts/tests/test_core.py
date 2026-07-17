@@ -110,6 +110,8 @@ from vtm_core.web import (
     parse_html_document,
     validate_public_url,
 )
+import vtm_core.zhihu as zhihu_module
+from vtm_core.zhihu import ZhihuSourceAdapter
 from video_manuscript import (
     bundle_job,
     cancel_job,
@@ -2202,7 +2204,11 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(bilibili["number"], 1)
         self.assertTrue(bilibili["adapter_installed"])
         self.assertTrue(bilibili["credentials"]["bilibili_cookie"])
-        self.assertEqual(platform_configuration("3", {})["platform"], "zhihu")
+        zhihu = platform_configuration("3", {})
+        self.assertEqual(zhihu["platform"], "zhihu")
+        self.assertTrue(zhihu["adapter_installed"])
+        self.assertEqual(zhihu["credentials"][0]["id"], "zhihu_z_c0")
+        self.assertFalse(zhihu["credentials"][0]["configured"])
         self.assertEqual(platform_configuration("B站", {})["platform"], "bilibili")
 
     def test_dedicated_secret_store_is_private_allowlisted_and_removable(self):
@@ -4574,6 +4580,7 @@ class CoreTests(unittest.TestCase):
             <p>先下载工具，再打开设置页面并启用对应选项。这一段包含足够长度的公开正文内容。</p>
             <img src="/images/step.png" alt="设置页面截图" width="800" height="500">
             <table><tr><th>字段</th><th>含义</th></tr><tr><td>mode</td><td>运行模式</td></tr></table>
+            <p>公式 <span class="ztext-math" data-tex="E=mc^2"></span>，参考<a href="https://link.zhihu.com/?target=https%3A%2F%2Fdocs.example.com%2Fguide">官方指南</a>并执行<code>vtm doctor</code>。</p>
             <p>最后检查输出字段，并确认任务状态显示完成；失败时应核对网络权限和输入地址。</p>
           </article>
           <div class="comment-list">评论区内容不能混入文章。</div>
@@ -4594,12 +4601,127 @@ class CoreTests(unittest.TestCase):
         )
         self.assertIn("## 安装步骤", rendered)
         self.assertIn("| 字段 | 含义 |", rendered)
+        self.assertIn("$E=mc^2$", rendered)
+        self.assertIn("[官方指南](https://docs.example.com/guide)", rendered)
+        self.assertIn("`vtm doctor`", rendered)
         self.assertNotIn("导航与登录", rendered)
         self.assertNotIn("评论区内容", rendered)
         self.assertTrue(all(segment.locator_kind == "document_order" for segment in segments))
         self.assertEqual(len(images), 1)
         self.assertEqual(images[0].url, "https://blog.example.com/images/step.png")
         self.assertIn(images[0].after_segment_id, {segment.id for segment in segments})
+
+    def test_zhihu_adapter_reuses_upstream_answer_html_as_document_evidence(self):
+        captured = {}
+
+        class FakeClient:
+            @staticmethod
+            async def get_answer(answer_id, credential=None):
+                captured["answer_id"] = answer_id
+                captured["credential"] = credential
+                return {
+                    "id": answer_id,
+                    "question": {"id": 12345, "title": "怎样验证一个提取流程？"},
+                    "author": {"name": "测试答主"},
+                    "created_time": 1700000000,
+                    "content": (
+                        "<h2>验证步骤</h2>"
+                        "<p>先运行测试，再检查输出中的观点、理由、步骤和限制条件。</p>"
+                        '<p>公式<span class="ztext-math" data-tex="a^2+b^2=c^2"></span>，'
+                        '<a href="https://link.zhihu.com/?target=https%3A%2F%2Fexample.com%2Fdocs">阅读文档</a>。</p>'
+                        '<img src="https://picx.zhimg.com/example.png" alt="验证结果截图">'
+                    ),
+                }
+
+        adapter = ZhihuSourceAdapter()
+        with patch("vtm_core.zhihu.zhihu_client", FakeClient), patch(
+            "vtm_core.zhihu.ZhihuCredential", object
+        ), patch.dict(os.environ, {}, clear=True):
+            info = adapter.inspect(
+                "https://www.zhihu.com/question/12345/answer/67890?utm_source=chat"
+            )
+        rendered = "\n".join(Segment(**item).text for item in info.segments)
+        self.assertEqual(captured["answer_id"], 67890)
+        self.assertIsNone(captured["credential"])
+        self.assertEqual(info.url, "https://www.zhihu.com/question/12345/answer/67890")
+        self.assertEqual(info.source_id, "answer-67890")
+        self.assertEqual(info.author, "测试答主")
+        self.assertEqual(info.access_mode, "public")
+        self.assertIn("## 验证步骤", rendered)
+        self.assertIn("$a^2+b^2=c^2$", rendered)
+        self.assertIn("[阅读文档](https://example.com/docs)", rendered)
+        self.assertEqual(len(info.images), 1)
+        self.assertEqual(adapter.reference(info).source_key, "zhihu:answer-67890")
+
+    def test_zhihu_adapter_uses_only_hidden_z_c0_for_authorized_article(self):
+        captured = {}
+
+        class FakeCredential:
+            def __init__(self, *, z_c0):
+                captured["z_c0"] = z_c0
+
+        class FakeClient:
+            @staticmethod
+            async def get_article(article_id, credential=None):
+                captured["credential"] = credential
+                return {
+                    "id": article_id,
+                    "title": "知乎专栏测试",
+                    "author": {"name": "文章作者"},
+                    "created": 1700000000,
+                    "content": "<p>这是一篇包含完整解释、示例和注意事项的公开文章正文。</p>",
+                }
+
+        with patch("vtm_core.zhihu.zhihu_client", FakeClient), patch(
+            "vtm_core.zhihu.ZhihuCredential", FakeCredential
+        ), patch.dict(os.environ, {"ZHIHU_Z_C0": "private-cookie"}, clear=True):
+            info = ZhihuSourceAdapter().inspect("https://zhuanlan.zhihu.com/p/998877")
+        self.assertEqual(captured["z_c0"], "private-cookie")
+        self.assertIs(captured["credential"].__class__, FakeCredential)
+        self.assertEqual(info.access_mode, "authorized_session")
+        self.assertNotIn("private-cookie", json.dumps(info.to_dict(), ensure_ascii=False))
+        self.assertEqual(info.source_id, "article-998877")
+
+    def test_zhihu_public_risk_control_returns_configuration_instruction(self):
+        class BlockedClient:
+            @staticmethod
+            async def get_answer(answer_id, credential=None):
+                raise zhihu_module.AuthenticationError("risk control")
+
+        with patch("vtm_core.zhihu.zhihu_client", BlockedClient), patch(
+            "vtm_core.zhihu.ZhihuCredential", object
+        ), patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "configure secret zhihu_z_c0"):
+                ZhihuSourceAdapter().inspect(
+                    "https://www.zhihu.com/question/12345/answer/67890"
+                )
+
+    def test_zhihu_network_error_does_not_request_a_cookie(self):
+        class OfflineClient:
+            @staticmethod
+            async def get_article(article_id, credential=None):
+                raise zhihu_module.NetworkError("offline")
+
+        with patch("vtm_core.zhihu.zhihu_client", OfflineClient), patch(
+            "vtm_core.zhihu.ZhihuCredential", object
+        ), patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "检查当前机器到知乎的网络") as caught:
+                ZhihuSourceAdapter().inspect("https://zhuanlan.zhihu.com/p/998877")
+        self.assertNotIn("zhihu_z_c0", str(caught.exception))
+
+    def test_zhihu_adapter_claims_only_answers_and_articles(self):
+        adapter = ZhihuSourceAdapter()
+        self.assertIsInstance(
+            adapter_for("https://www.zhihu.com/question/12345/answer/67890"),
+            ZhihuSourceAdapter,
+        )
+        self.assertTrue(adapter.can_handle("https://www.zhihu.com/en/answer/67890"))
+        self.assertTrue(adapter.can_handle("https://www.zhihu.com/en/article/998877"))
+        self.assertFalse(adapter.can_handle("https://www.zhihu.com/question/12345"))
+        self.assertEqual(
+            adapter.normalize_input_url("https://www.zhihu.com/en/article/998877"),
+            "https://zhuanlan.zhihu.com/p/998877",
+        )
 
     def test_generic_web_url_policy_removes_tracking_and_blocks_private_networks(self):
         canonical = canonicalize_web_url(

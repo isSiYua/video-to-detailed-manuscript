@@ -160,6 +160,69 @@ def _node_text(node: HtmlNode, *, include_alt: bool = False) -> str:
     return text.strip()
 
 
+def _content_link(value: str, base_url: str) -> str:
+    resolved = urllib.parse.urljoin(base_url, str(value or "").strip())
+    parsed = urllib.parse.urlparse(resolved)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return ""
+    if parsed.hostname.lower() == "link.zhihu.com":
+        target = urllib.parse.parse_qs(parsed.query).get("target", [""])[0]
+        candidate = urllib.parse.unquote(target).strip()
+        target_parsed = urllib.parse.urlparse(candidate)
+        if target_parsed.scheme in {"http", "https"} and target_parsed.hostname:
+            return candidate
+    return resolved
+
+
+def _content_text(node: HtmlNode, base_url: str) -> str:
+    """Render inline evidence without discarding links, code, or LaTeX."""
+
+    parts: list[str] = []
+    for child in node.children:
+        if isinstance(child, str):
+            parts.append(child)
+            continue
+        if child.tag in EXCLUDED_TAGS:
+            continue
+        if child.tag == "br":
+            parts.append("\n")
+            continue
+        latex = child.attrs.get("data-tex", "").strip()
+        if latex:
+            delimiter = "$$" if "\\tag" in latex or "\n" in latex else "$"
+            parts.append(f"{delimiter}{latex}{delimiter}")
+            continue
+        if child.tag == "a":
+            label = _content_text(child, base_url) or _node_text(child)
+            target = _content_link(child.attrs.get("href", ""), base_url)
+            parts.append(f"[{label}]({target})" if label and target else label)
+            continue
+        if child.tag == "code" and node.tag != "pre":
+            code = _node_text(child)
+            parts.append(f"`{code}`" if code else "")
+            continue
+        parts.append(_content_text(child, base_url))
+
+    merged = ""
+    for part in parts:
+        if (
+            merged
+            and part
+            and not merged[-1].isspace()
+            and not part[0].isspace()
+            and (
+                (merged[-1].isascii() and merged[-1].isalnum() and part[0].isascii() and part[0].isalnum())
+                or (merged[-1] in ".!?:;" and part[0].isascii() and part[0].isalnum())
+            )
+        ):
+            merged += " "
+        merged += part
+    text = html.unescape(merged).replace("\xa0", " ")
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    return text.strip()
+
+
 def _walk(node: HtmlNode) -> Iterable[HtmlNode]:
     yield node
     for child in node.children:
@@ -274,13 +337,13 @@ def _image_url(node: HtmlNode, base_url: str) -> str:
     return resolved if parsed.scheme in {"http", "https"} and parsed.hostname else ""
 
 
-def _table_markdown(node: HtmlNode) -> str:
+def _table_markdown(node: HtmlNode, base_url: str = "") -> str:
     rows: list[list[str]] = []
     for row in _walk(node):
         if row.tag != "tr":
             continue
         cells = [
-            re.sub(r"\s+", " ", _node_text(cell)).replace("|", "\\|").strip()
+            re.sub(r"\s+", " ", _content_text(cell, base_url)).replace("|", "\\|").strip()
             for cell in row.children
             if isinstance(cell, HtmlNode) and cell.tag in {"th", "td"}
         ]
@@ -296,7 +359,9 @@ def _table_markdown(node: HtmlNode) -> str:
     )
 
 
-def parse_html_document(raw_html: str, url: str) -> tuple[dict[str, str], list[Segment], list[DocumentImage]]:
+def parse_html_document(
+    raw_html: str, url: str, *, minimum_text_chars: int = 80
+) -> tuple[dict[str, str], list[Segment], list[DocumentImage]]:
     parser = _TreeParser()
     parser.feed(raw_html)
     root = parser.root
@@ -413,14 +478,14 @@ def parse_html_document(raw_html: str, url: str) -> tuple[dict[str, str], list[S
             return after_id
         if node.tag == "table":
             consumed.add(id(node))
-            after_id = add_text(_table_markdown(node), "table")
+            after_id = add_text(_table_markdown(node, url), "table")
             for child in _walk(node):
                 if child.tag == "img":
                     add_image(child, after_id)
             return after_id
         if node.tag in BLOCK_TAGS:
             consumed.add(id(node))
-            after_id = add_text(_node_text(node), node.tag)
+            after_id = add_text(_content_text(node, url), node.tag)
             for child in _walk(node):
                 if child.tag == "img":
                     add_image(child, after_id)
@@ -433,7 +498,7 @@ def parse_html_document(raw_html: str, url: str) -> tuple[dict[str, str], list[S
     visit(content)
     if not segments:
         raise RuntimeError("公开页面中没有找到可用正文")
-    if sum(len(segment.text) for segment in segments) < 80:
+    if sum(len(segment.text) for segment in segments) < max(1, minimum_text_chars):
         raise RuntimeError("公开页面正文过短，可能需要登录或浏览器渲染")
     published_match = re.search(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[T\s]\d{1,2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?", published_at)
     if published_match:

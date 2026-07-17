@@ -31,7 +31,7 @@ Implemented for public HTTP(S) pages. It reuses Apache-2.0 `readability-lxml` fo
 
 ### Zhihu
 
-Treat public articles and answers as structured web documents. Public video follows the video pipeline when an authorized media URL is available. Login-only, paid, deleted, or risk-controlled content should return an explicit access limitation instead of attempting a bypass.
+Implemented for answer and article URLs through the Apache-2.0 `zhihu-tui` 0.1.3 structured client. Its raw HTML is converted through the common document evidence path so links, inline code, LaTeX, and original figures survive into the four semantic editing passes. The adapter attempts an unauthenticated read first; current local and mainland test exits were both risk-controlled, so the platform menu explains how to provide the user's own `z_c0` through hidden SSH input. It never scans local browsers, embeds a shared Cookie, collects comments, or treats the invite-only official search Access Secret as arbitrary URL/full-content authorization. Paid, deleted, or account-inaccessible content returns an explicit limitation. Zhihu video remains outside this document adapter until an authorized media path is separately reviewed.
 
 ### Douyin and Xiaohongshu
 
@@ -46,5 +46,5 @@ A single image-capable provider/model may already serve both text and vision by 
 1. Freeze and publish the Bilibili core with reproducible tests and no credentials or private artifacts.
 2. Add the source-adapter protocol without changing Bilibili output.
 3. Implement YouTube and generic web-page adapters with fixture-based regression tests (complete).
-4. Add Zhihu public pages.
+4. Add Zhihu answer/article documents (complete).
 5. Evaluate Douyin and Xiaohongshu as optional integrations against platform stability and account safety.

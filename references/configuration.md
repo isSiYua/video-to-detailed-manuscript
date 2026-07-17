@@ -46,6 +46,7 @@ scripts/vtm prepare-asr
 | `VTM_MAX_CONCURRENT_JOBS` | Maximum detached video workers on one server; values above `4` are clamped | `2` |
 | `VTM_PROGRESS_TARGET` | Optional Hermes one-shot delivery target, such as `feishu` or `feishu:chat_id` | unset |
 | `VTM_SOURCE_PROXY` | Optional HTTPS proxy used only for remote source acquisition on restricted server networks | unset |
+| `ZHIHU_Z_C0` | Optional Zhihu login-session `z_c0`; used only when a public answer/article read is risk-controlled | unset |
 | `VTM_PYTHON` | Prepared Python 3.10+ interpreter used by `scripts/vtm`; set in the service environment, not the CLI env file | auto-detect |
 
 Keep secrets in the service manager's secret store or an environment file readable only by the service account. Do not put them in `SKILL.md`, Obsidian, job JSON, logs, or Agent prompts.
@@ -102,9 +103,22 @@ scripts/vtm configure secret bilibili_cookie
 
 The dedicated store defaults to `~/.config/video-to-detailed-manuscript/secrets.env`; its directory is `0700`, the file and lock are `0600`, and writes are atomic. It contains only allowlisted project variables. The loader reads this project file first and fills still-missing allowlisted values from the legacy `~/.hermes/.env`; it never loads unrelated environment entries. Status output contains booleans and labels only.
 
-Public acquisition is preferred. Bilibili public videos need no credential; its complete Cookie header is optional. YouTube public video extraction is installed and needs no API Key; a Data API Key remains an optional metadata/API enhancement, not a universal subtitle credential. Public Zhihu pages are planned without a key, while its official Access Secret enables only the APIs actually granted. Douyin official client credentials apply only to reviewed applications and authorized scopes. The currently documented Xiaohongshu merchant/mini-app credentials are not treated as a general public-note reading API.
+Public acquisition is preferred. Bilibili public videos need no credential; its complete Cookie header is optional. YouTube public video extraction is installed and needs no API Key; a Data API Key remains an optional metadata/API enhancement, not a universal subtitle credential. Zhihu answer/article extraction attempts public API access first and may require the user's own `z_c0` when risk control rejects anonymous traffic. Douyin official client credentials apply only to reviewed applications and authorized scopes. The currently documented Xiaohongshu merchant/mini-app credentials are not treated as a general public-note reading API.
 
 Generic web/CSDN extraction is installed and needs no credential. It installs the Apache-2.0 `readability-lxml` body extractor and BSD-3-Clause `extruct` JSON-LD metadata parser, accepts public HTTP(S) article URLs, rejects local/private network targets, and does not bypass login, payment, JavaScript-only rendering, or risk control. A CSDN page may return HTTP 521 or reset a connection for a particular local or server exit; use another policy-compliant network path if available, rather than public proxy lists or third-party reader services.
+
+## Zhihu acquisition
+
+Zhihu answer and article extraction is installed through the Apache-2.0 `zhihu-tui` client. It first calls the fixed public answer/article endpoints without a credential. Both the Denmark development exit and the mainland production exit returned Zhihu risk-control errors during release testing, so anonymous success must be treated as best effort rather than guaranteed.
+
+When a public URL is readable in the user's logged-in browser but anonymous extraction is rejected, obtain `z_c0` from that user's own session:
+
+1. Log in at `https://www.zhihu.com/` with a dedicated, low-risk account that is authorized to read the content.
+2. Open browser developer tools, choose Application/Storage → Cookies → `https://www.zhihu.com`, and copy only the value of `z_c0`.
+3. SSH into the Hermes server and run `scripts/vtm configure secret zhihu_z_c0`; paste the value into the hidden prompt.
+4. Run `scripts/vtm configure platform 3` to verify only that the credential is configured, then retry the URL.
+
+Never send `z_c0` through Hermes, Feishu, Codex, or another chat. It is not written to task metadata, logs, the Vault, or exported ZIPs. The official `developer.zhihu.com` Access Secret currently covers invite-only search/answer products and requires approved access; it is not used as proof that an arbitrary answer/article URL can be exported in full. The adapter does not fetch paid, deleted, comments, or otherwise inaccessible content.
 
 ## YouTube acquisition
 

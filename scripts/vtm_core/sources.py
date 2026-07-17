@@ -243,9 +243,15 @@ def source_adapters() -> tuple[SourceAdapter, ...]:
     """Return installed adapters in deterministic matching order."""
 
     from .youtube import YouTubeSourceAdapter
+    from .zhihu import ZhihuSourceAdapter
     from .web import GenericWebSourceAdapter
 
-    return (BilibiliSourceAdapter(), YouTubeSourceAdapter(), GenericWebSourceAdapter())
+    return (
+        BilibiliSourceAdapter(),
+        YouTubeSourceAdapter(),
+        ZhihuSourceAdapter(),
+        GenericWebSourceAdapter(),
+    )
 
 
 def adapter_by_platform(platform: str) -> SourceAdapter:

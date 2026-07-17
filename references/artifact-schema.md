@@ -26,6 +26,8 @@ Public documents use a parallel layout:
 <vault>/Indexes/来源资料库.md
 ```
 
+Zhihu answers and articles use `[ZH-A-answer_id]` and `[ZH-P-article_id]` markers in the same document tree.
+
 Operational content outside the Vault:
 
 ```text

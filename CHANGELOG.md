@@ -13,6 +13,8 @@
 - Reuses Apache-2.0 `readability-lxml` for main-article selection, with a deterministic structure-fidelity fallback when upstream cleanup would drop tables, code, or original images.
 - Reuses BSD-3-Clause `extruct` for standard JSON-LD article title, author, publication time, and publisher metadata instead of adding site-specific metadata scrapers.
 - Rejects credential-bearing, non-HTTP(S), localhost, private, and reserved source URLs; bounds HTML/image response sizes and excludes navigation, comments, recommendations, and other page chrome.
+- Adds Zhihu answer/article support through the Apache-2.0 `zhihu-tui` client, reusing the document manuscript core while preserving links, inline code, LaTeX, and original images.
+- Attempts Zhihu public reads first and reports an actionable limitation when risk control requires the user's hidden `z_c0`; no shared Cookie or unofficial public key is embedded.
 
 ## 1.1.0 — deployment packaging
 
