@@ -244,6 +244,7 @@ def source_adapters() -> tuple[SourceAdapter, ...]:
 
     from .youtube import YouTubeSourceAdapter
     from .douyin import DouyinSourceAdapter
+    from .xiaohongshu import XiaohongshuSourceAdapter
     from .zhihu import ZhihuSourceAdapter
     from .web import GenericWebSourceAdapter
 
@@ -251,6 +252,7 @@ def source_adapters() -> tuple[SourceAdapter, ...]:
         BilibiliSourceAdapter(),
         YouTubeSourceAdapter(),
         DouyinSourceAdapter(),
+        XiaohongshuSourceAdapter(),
         ZhihuSourceAdapter(),
         GenericWebSourceAdapter(),
     )

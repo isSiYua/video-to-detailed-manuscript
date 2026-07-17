@@ -30,6 +30,8 @@ Zhihu answers and articles use `[ZH-A-answer_id]` and `[ZH-P-article_id]` marker
 
 Douyin videos remain in the video tree and use `[DY-aweme_id]` markers.
 
+Xiaohongshu/RedNote image notes remain in the document tree and use `[XHS-note_id]` markers.
+
 Operational content outside the Vault:
 
 ```text

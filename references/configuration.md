@@ -113,6 +113,14 @@ The public share page normally exposes no native subtitle track. The pipeline th
 
 `scripts/vtm configure platform 5` should report the adapter as installed and show an empty credential list. Official Client Key/Secret can be added later only with a concrete reviewed application and approved user-authorization scope; they are not useful for this public URL path.
 
+## Xiaohongshu / RedNote acquisition
+
+Public `xiaohongshu.com/explore/...`, `xiaohongshu.com/discovery/item/...`, current `rednote.com/explore/...`, `xhslink.com/...`, and ordinary share text containing those links need no credential. The adapter adapts the Apache-2.0 Social Media Toolkit initial-state parser and reads only one public image note's title, body blocks, topics, author, publication time, and ordered original image list.
+
+The current RedNote domain often includes an `xsec_token` in the public share URL. The adapter preserves that URL parameter because it identifies the shared public view; it is not treated as an account Cookie and is never reused for profiles, search, comments, interactions, or other notes. Image downloads accept only known Xiaohongshu/RedNote CDN hosts and retain a maximum of 60 images under the common document budget. Equal text-block/image counts are paired in order; otherwise images stay together as the note's ordered gallery.
+
+`scripts/vtm configure platform 6` should report the adapter as installed with an empty credential list. A redirect to login, `/404`, captcha, risk-control page, empty initial state, video note, or missing original images returns an explicit limitation. Do not send browser Cookies through chat, auto-read server browser profiles, install fingerprint browsers, or use third-party parsing services for this public mode.
+
 Generic web/CSDN extraction is installed and needs no credential. It installs the Apache-2.0 `readability-lxml` body extractor and BSD-3-Clause `extruct` JSON-LD metadata parser, accepts public HTTP(S) article URLs, rejects local/private network targets, and does not bypass login, payment, JavaScript-only rendering, or risk control. A CSDN page may return HTTP 521 or reset a connection for a particular local or server exit; use another policy-compliant network path if available, rather than public proxy lists or third-party reader services.
 
 ## Zhihu acquisition

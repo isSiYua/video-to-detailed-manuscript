@@ -100,12 +100,12 @@ PLATFORM_SPECS = (
         6,
         "xiaohongshu",
         "小红书",
-        ("小红书", "xhs", "xiaohongshu"),
-        False,
-        "计划提供公开分享链接 best-effort 模式。",
+        ("小红书", "xhs", "xiaohongshu", "rednote"),
+        True,
+        "公开图文笔记无凭据模式已安装；正文与原图按来源顺序进入文档管线。",
         (),
-        "https://miniapp.xiaohongshu.com/",
-        "现有小程序/商家授权不能冒充通用笔记读取权限，因此暂不收取平台 Secret。",
+        "https://www.xiaohongshu.com/",
+        "只处理公开图文笔记；视频笔记、登录、验证码、删除和风险控制内容不会被绕过。商家/小程序凭据不是通用笔记读取权限。",
     ),
 )
 

@@ -116,6 +116,11 @@ from vtm_core.youtube import (
     parse_youtube_json3,
     parse_youtube_vtt,
 )
+from vtm_core.xiaohongshu import (
+    _XhsImageRedirectHandler,
+    XiaohongshuSourceAdapter,
+    parse_xhs_initial_state,
+)
 from vtm_core.web import (
     GenericWebInfo,
     GenericWebSourceAdapter,
@@ -388,6 +393,10 @@ class CoreTests(unittest.TestCase):
             ["bilibili", "youtube", "douyin"],
         )
         self.assertFalse(payload["acquisition"]["youtube_public_mode_requires_api_key"])
+        self.assertEqual(
+            payload["acquisition"]["installed_document_platforms"],
+            ["generic_web", "zhihu", "xiaohongshu"],
+        )
         self.assertTrue(
             payload["acquisition"]["youtube_automatic_caption_prefers_original_language"]
         )
@@ -2228,6 +2237,10 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(douyin["adapter_installed"])
         self.assertEqual(douyin["credentials"], [])
         self.assertIn("无需配置", douyin["secret_instruction"])
+        xhs = platform_configuration("6", {})
+        self.assertEqual(xhs["platform"], "xiaohongshu")
+        self.assertTrue(xhs["adapter_installed"])
+        self.assertEqual(xhs["credentials"], [])
         self.assertEqual(platform_configuration("B站", {})["platform"], "bilibili")
 
     def test_dedicated_secret_store_is_private_allowlisted_and_removable(self):
@@ -4688,6 +4701,131 @@ class CoreTests(unittest.TestCase):
         folder = _source_folder_name("20260717-1", "很长的抖音标题" * 30, marker)
         self.assertLessEqual(len(folder), 100)
         self.assertTrue(folder.endswith(f"[{marker}]"))
+
+    def test_xiaohongshu_initial_state_preserves_text_topics_and_original_image_order(self):
+        note_id = "696a395e000000000a02b3c7"
+        state = {
+            "note": {
+                "noteDetailMap": {
+                    note_id: {
+                        "note": {
+                            "noteId": note_id,
+                            "title": "四种面条做法合集",
+                            "desc": "第一种：准备番茄和鸡蛋。\n第二种：煮面后加入调味汁。",
+                            "type": "normal",
+                            "time": 1700000000000,
+                            "user": {"userId": "user-1", "nickname": "测试作者"},
+                            "tagList": [{"name": "家常菜"}],
+                            "imageList": [
+                                {"urlDefault": "https://sns-web-i10.rednotecdn.com/one.jpg"},
+                                {"urlPre": "http://sns-web-i10.rednotecdn.com/two.jpg"},
+                            ],
+                        }
+                    }
+                }
+            }
+        }
+        raw_html = (
+            "<html><head><title>后备标题</title></head><body>"
+            f"<script>window.__INITIAL_STATE__={json.dumps(state, ensure_ascii=False)}</script>"
+            "</body></html>"
+        )
+        info = parse_xhs_initial_state(
+            raw_html,
+            f"https://www.rednote.com/explore/{note_id}?xsec_token=public",
+        )
+        rendered = "\n".join(Segment(**item).text for item in info.segments)
+        self.assertEqual(info.note_id, note_id)
+        self.assertEqual(info.title, "四种面条做法合集")
+        self.assertEqual(info.author, "测试作者")
+        self.assertEqual(info.content_type, "image_note")
+        self.assertIn("第一种", rendered)
+        self.assertIn("第二种", rendered)
+        self.assertIn("#家常菜", rendered)
+        self.assertEqual(len(info.images), 2)
+        self.assertTrue(info.images[0]["url"].endswith("/one.jpg"))
+        self.assertTrue(info.images[1]["url"].startswith("https://"))
+        self.assertEqual([item["order"] for item in info.images], [1, 2])
+        self.assertTrue(all(item["after_segment_id"] == info.segments[-1]["id"] for item in info.images))
+
+    def test_xiaohongshu_equal_text_and_image_counts_keep_one_to_one_order(self):
+        note_id = "696a395e000000000a02b3c7"
+        note = {
+            "noteId": note_id,
+            "title": "两步教程",
+            "desc": "第一步准备材料\n第二步完成制作",
+            "type": "normal",
+            "imageList": [
+                {"urlDefault": "https://sns-web-i10.rednotecdn.com/step-1.jpg"},
+                {"urlDefault": "https://sns-web-i10.rednotecdn.com/step-2.jpg"},
+            ],
+        }
+        state = {"note": {"noteDetailMap": {note_id: {"note": note}}}}
+        raw_html = f"<script>window.__INITIAL_STATE__={json.dumps(state, ensure_ascii=False)}</script>"
+        info = parse_xhs_initial_state(raw_html, f"https://www.rednote.com/explore/{note_id}")
+        self.assertEqual(
+            [item["after_segment_id"] for item in info.images],
+            [item["id"] for item in info.segments],
+        )
+
+    def test_xiaohongshu_adapter_supports_current_legacy_and_bare_share_links(self):
+        adapter = XiaohongshuSourceAdapter()
+        note_id = "696a395e000000000a02b3c7"
+        rednote = f"https://www.rednote.com/explore/{note_id}?xsec_token=public&utm_source=chat"
+        legacy = f"https://www.xiaohongshu.com/discovery/item/{note_id}"
+        self.assertTrue(adapter.can_handle(rednote))
+        self.assertTrue(adapter.can_handle(legacy))
+        self.assertTrue(adapter.can_handle("复制打开 xhslink.com/m/example 查看笔记"))
+        self.assertEqual(
+            adapter.canonicalize_input(rednote),
+            f"https://www.rednote.com/explore/{note_id}?xsec_token=public",
+        )
+        self.assertEqual(adapter.source_id_from_url(legacy), f"note-{note_id}")
+        self.assertIsInstance(adapter_for(rednote), XiaohongshuSourceAdapter)
+        self.assertFalse(GenericWebSourceAdapter().can_handle(rednote))
+
+    def test_xiaohongshu_short_link_reuses_public_redirect(self):
+        adapter = XiaohongshuSourceAdapter()
+        note_id = "696a395e000000000a02b3c7"
+        with patch.object(
+            adapter,
+            "_fetch_html",
+            return_value=("", f"https://www.xiaohongshu.com/explore/{note_id}?xsec_token=public"),
+        ):
+            canonical = adapter.canonicalize_input("xhslink.com/m/example")
+        self.assertEqual(
+            canonical,
+            f"https://www.xiaohongshu.com/explore/{note_id}?xsec_token=public",
+        )
+
+    def test_xiaohongshu_rejects_video_and_empty_risk_control_state(self):
+        note_id = "696a395e000000000a02b3c7"
+        video_state = {
+            "note": {
+                "noteDetailMap": {
+                    note_id: {
+                        "note": {
+                            "noteId": note_id,
+                            "title": "视频",
+                            "type": "video",
+                            "video": {"media": {}},
+                            "imageList": [],
+                        }
+                    }
+                }
+            }
+        }
+        video_html = f"<script>window.__INITIAL_STATE__={json.dumps(video_state)}</script>"
+        with self.assertRaisesRegex(RuntimeError, "视频笔记"):
+            parse_xhs_initial_state(video_html, f"https://www.rednote.com/explore/{note_id}")
+        empty_html = '<script>window.__INITIAL_STATE__={"note":{"noteDetailMap":{}}}</script>'
+        with self.assertRaisesRegex(RuntimeError, "没有返回公开笔记详情"):
+            parse_xhs_initial_state(empty_html, f"https://www.rednote.com/explore/{note_id}")
+
+    def test_xiaohongshu_rejects_image_redirect_to_untrusted_host(self):
+        handler = _XhsImageRedirectHandler()
+        with self.assertRaisesRegex(RuntimeError, "不受信任"):
+            handler.redirect_request(None, None, 302, "Found", {}, "https://example.com/image.jpg")
 
     def test_generic_web_parser_preserves_ordered_article_text_images_and_tables(self):
         source = """

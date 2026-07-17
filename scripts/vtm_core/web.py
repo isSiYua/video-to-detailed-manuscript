@@ -587,6 +587,7 @@ class GenericWebSourceAdapter:
     _reserved_hosts = (
         "bilibili.com", "b23.tv", "youtube.com", "youtu.be", "zhihu.com",
         "douyin.com", "iesdouyin.com", "xiaohongshu.com", "xhslink.com",
+        "rednote.com",
     )
 
     def can_handle(self, value: str) -> bool:
