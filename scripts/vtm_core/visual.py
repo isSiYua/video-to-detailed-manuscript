@@ -14,6 +14,8 @@ from .models import Frame, Segment
 from .utils import require_command, timestamp
 
 SHOWINFO_RE = re.compile(r"pts_time:([0-9]+(?:\.[0-9]+)?)")
+FREEZE_START_RE = re.compile(r"lavfi\.freezedetect\.freeze_start:\s*(-?[0-9]+(?:\.[0-9]+)?)")
+FREEZE_END_RE = re.compile(r"lavfi\.freezedetect\.freeze_end:\s*(-?[0-9]+(?:\.[0-9]+)?)")
 VISUAL_HINT_RE = re.compile(
     r"(?:图|表|界面|屏幕|这里|这个|步骤|设置|代码|参数|数据|对比|效果|演示|点击|选择|输入|看一下|如图|如下|\d)"
 )
@@ -28,6 +30,15 @@ TEXT_SENSITIVE_VISUAL_KINDS = {
     "text", "list", "table", "code", "formula",
     "diagram", "chart", "process", "ui", "paper_figure", "comparison",
 }
+COMPLETION_SEEK_VISUAL_KINDS = {
+    "text", "list", "table", "code", "formula", "diagram", "chart",
+    "process", "ui", "paper_figure",
+}
+DYNAMIC_VISUAL_PURPOSE_RE = re.compile(
+    r"(?:关键瞬间|实验过程|游戏|机器人|动态模拟|实物演示|运动轨迹|动作过程|前后对比|对照状态)"
+)
+FREEZE_NOISE_RATIO = 0.002
+FREEZE_MIN_DURATION = 1.2
 
 
 def asset_filename(task_key: str, index: int, at: float) -> str:
@@ -252,6 +263,198 @@ def detect_scenes(video: Path, threshold: float) -> list[float]:
     )
     text = result.stderr.decode("utf-8", errors="replace")
     return sorted({float(value) for value in SHOWINFO_RE.findall(text)})
+
+
+def _parse_freeze_intervals(
+    log_text: str, *, window_start: float, window_duration: float
+) -> list[tuple[float, float]]:
+    """Parse FFmpeg freezedetect events into absolute, closed intervals."""
+    intervals: list[tuple[float, float]] = []
+    current: float | None = None
+    events: list[tuple[int, str, float]] = []
+    for match in FREEZE_START_RE.finditer(log_text):
+        events.append((match.start(), "start", float(match.group(1))))
+    for match in FREEZE_END_RE.finditer(log_text):
+        events.append((match.start(), "end", float(match.group(1))))
+    for _position, kind, value in sorted(events):
+        relative = min(window_duration, max(0.0, value))
+        if kind == "start":
+            current = relative
+        elif current is not None and relative > current:
+            intervals.append((window_start + current, window_start + relative))
+            current = None
+    if current is not None and window_duration > current:
+        intervals.append((window_start + current, window_start + window_duration))
+    return intervals
+
+
+def detect_stable_intervals(
+    video: Path,
+    start: float,
+    end: float,
+    *,
+    noise: float = FREEZE_NOISE_RATIO,
+    minimum_duration: float = FREEZE_MIN_DURATION,
+) -> list[tuple[float, float]]:
+    """Use FFmpeg locally on one bounded scene; no candidate images are saved."""
+    if end - start < minimum_duration:
+        return []
+    ffmpeg = require_command("ffmpeg")
+    duration = end - start
+    result = subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-ss",
+            f"{max(0.0, start):.3f}",
+            "-t",
+            f"{duration:.3f}",
+            "-i",
+            str(video),
+            "-map",
+            "0:v:0",
+            "-vf",
+            (
+                "scale=320:-2,setpts=PTS-STARTPTS,"
+                f"freezedetect=n={noise}:d={minimum_duration}"
+            ),
+            "-an",
+            "-f",
+            "null",
+            "-",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        timeout=max(30, min(300, math.ceil(duration * 3))),
+        check=False,
+    )
+    log_text = result.stderr.decode("utf-8", errors="replace")
+    if result.returncode != 0:
+        raise RuntimeError("FFmpeg freezedetect failed for bounded scene")
+    return _parse_freeze_intervals(
+        log_text, window_start=start, window_duration=duration
+    )
+
+
+def _completion_request_for_time(
+    at: float, visual_requests: list[dict[str, object]] | None
+) -> dict[str, object] | None:
+    """Return a request where moving toward a completed state is semantically safe."""
+    matches: list[dict[str, object]] = []
+    for request in visual_requests or []:
+        try:
+            start = float(request.get("time_start", 0.0))
+            end = float(request.get("time_end", start))
+        except (TypeError, ValueError):
+            continue
+        kind = str(request.get("expected_kind") or "").strip().lower()
+        purpose = str(request.get("purpose") or "")
+        if (
+            start <= at <= end
+            and kind in COMPLETION_SEEK_VISUAL_KINDS
+            and not DYNAMIC_VISUAL_PURPOSE_RE.search(purpose)
+        ):
+            matches.append(request)
+    if not matches:
+        return None
+    return min(
+        matches,
+        key=lambda item: float(item.get("time_end", at)) - float(item.get("time_start", at)),
+    )
+
+
+def _scene_window(
+    at: float,
+    scenes: list[float],
+    request: dict[str, object],
+    duration: float,
+) -> tuple[float, float] | None:
+    try:
+        request_start = max(0.0, float(request.get("time_start", 0.0)))
+        request_end = min(duration, float(request.get("time_end", duration)))
+    except (TypeError, ValueError):
+        return None
+    if request_end - request_start < 0.8:
+        return None
+    boundaries = [request_start]
+    boundaries.extend(scene for scene in scenes if request_start < scene < request_end)
+    boundaries.append(request_end)
+    boundaries = sorted(set(boundaries))
+    for index in range(len(boundaries) - 1):
+        start, end = boundaries[index], boundaries[index + 1]
+        is_last = index == len(boundaries) - 2
+        if start <= at < end or (is_last and at == end):
+            return start, end
+    return None
+
+
+def refine_completion_timestamps(
+    video: Path,
+    candidates: list[tuple[float, float]],
+    scenes: list[float],
+    visual_requests: list[dict[str, object]] | None,
+    duration: float,
+) -> tuple[list[tuple[float, float]], dict[str, int]]:
+    """Move only completion-safe candidates to a later stable state.
+
+    Stable intervals are preferred.  A scene midpoint/rear probe is a bounded
+    fallback, and a candidate is never moved backwards.  Dynamic and comparison
+    requests do not enter this function's refinement path.
+    """
+    cache: dict[tuple[int, int], list[tuple[float, float]] | None] = {}
+    refined: list[tuple[float, float]] = []
+    stable_count = 0
+    rear_fallback_count = 0
+    unchanged_count = 0
+    for at, score in candidates:
+        request = _completion_request_for_time(at, visual_requests)
+        window = _scene_window(at, scenes, request, duration) if request else None
+        if window is None:
+            refined.append((at, score))
+            unchanged_count += 1
+            continue
+        start, end = window
+        key = (round(start * 10), round(end * 10))
+        if key not in cache:
+            try:
+                cache[key] = detect_stable_intervals(video, start, end)
+            except Exception:
+                cache[key] = None
+        intervals = cache[key]
+        target = at
+        if intervals:
+            credible = [
+                interval for interval in intervals
+                if interval[1] - interval[0] >= FREEZE_MIN_DURATION
+            ]
+            if credible:
+                freeze_start, freeze_end = max(credible, key=lambda item: item[1])
+                proposal = min(end - 0.20, freeze_end - 0.15)
+                if proposal >= freeze_start + 0.20 and proposal > at + 0.20:
+                    target = proposal
+                    stable_count += 1
+        if target == at and intervals == []:
+            span = end - start
+            proposal = (
+                (start + end) / 2
+                if span < 4.0
+                else start + span * 0.80
+            )
+            proposal = min(end - 0.20, max(start + 0.20, proposal))
+            if proposal > at + 0.20:
+                target = proposal
+                rear_fallback_count += 1
+        if target == at:
+            unchanged_count += 1
+        refined.append((round(target, 3), score))
+    return refined, {
+        "stable_completion_adjusted_count": stable_count,
+        "rear_fallback_adjusted_count": rear_fallback_count,
+        "completion_timing_unchanged_count": unchanged_count,
+        "stability_window_count": len(cache),
+    }
 
 
 def nearest_segments(segments: list[Segment], at: float, window: float = 8.0) -> list[Segment]:
@@ -642,9 +845,13 @@ def extract_useful_frames(
     threshold = calibrate_threshold(video, duration)
     scenes = detect_scenes(video, threshold)
     retained: list[tuple[Frame, float]] = []
-    for at, base_score in candidate_times(
+    candidates = candidate_times(
         scenes, segments, duration, max_frames, visual_requests
-    ):
+    )
+    candidates, timing_meta = refine_completion_timestamps(
+        video, candidates, scenes, visual_requests, duration
+    )
+    for at, base_score in candidates:
         try:
             pixels = raw_gray_frame(video, at)
         except Exception:
@@ -720,4 +927,5 @@ def extract_useful_frames(
         "retained_count": len(final_frames),
         "planner_visual_request_count": len(visual_requests or []),
         "vision_review_count": len(vision_ids),
+        **timing_meta,
     }

@@ -1,6 +1,6 @@
 # video-to-detailed-manuscript
 
-把 Bilibili、YouTube、抖音公共视频，小红书/RedNote 图文笔记、知乎回答/文章和普通公开网页整理成适合 Obsidian 的“有结构、有细节、有证据”的完整编辑文字稿，而不是简短摘要、原始 ASR 字幕或网页复制粘贴；更多来源通过同一适配器协议接入。
+把 Bilibili/YouTube/抖音公共视频、Bilibili opus/专栏文章、小红书/RedNote 图文笔记、知乎回答/文章和普通公开网页整理成适合 Obsidian 的“有结构、有细节、有证据”的完整编辑文字稿，而不是简短摘要、原始 ASR 字幕或网页复制粘贴；更多来源通过同一适配器协议接入。
 
 这是一个可移植 Agent Skill：核心工作由确定性 Python CLI 完成，Hermes、Codex、Claude Code、OpenCode、Kimi Code 等支持 Skill/命令调用的 Agent 只负责理解自然语言、启动任务和传送结果。
 
@@ -9,6 +9,7 @@
 - 字幕优先：原生字幕 → 登录态 AI 字幕/总结片段 → 本地 FunASR。
 - YouTube 公共模式优先人工字幕，再使用原语言自动字幕，缺失时才下载单路音频进行本地 ASR；不要求 API Key。
 - 普通网页/CSDN 公共模式提取正文、标题、作者、标题层级、列表、表格、代码和原图；跳过视频下载与 ASR。
+- Bilibili `/opus/<id>` 和 `/read/cv<id>` 按公开图文文档处理，绝不进入 BV 视频解析；任务下载继续使用同一来源无关的 ZIP 打包路径。
 - 网页正文选择复用 Apache-2.0 `readability-lxml`，标准 JSON-LD 元数据复用 BSD-3-Clause `extruct`；本项目只增加安全下载、结构保真、证据顺序和 Obsidian 编排。
 - 知乎回答/文章复用 Apache-2.0 `zhihu-tui` 获取结构化原始 HTML，保留链接、代码、LaTeX 和原图；先尝试公开读取，风控要求登录时使用用户自己的隐藏 `z_c0`。
 - 抖音公开视频复用 Apache-2.0 `social-post-extractor-mcp` 的公开分享页解析路径；不需要 API Key，页面没有原生字幕时只下载一次视频并交给既有本地 ASR，720p 分析后再从原始媒体定点取高清画面。

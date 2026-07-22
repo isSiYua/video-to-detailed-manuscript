@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
@@ -130,7 +131,15 @@ class BilibiliSourceAdapter:
         text = str(value or "").strip()
         normalized = self.client.normalize_input_url(text)
         parsed = urllib.parse.urlparse(normalized)
-        return (parsed.hostname or "").lower() in ALLOWED_HOSTS
+        host = (parsed.hostname or "").lower()
+        if host not in ALLOWED_HOSTS:
+            return False
+        if host in {"b23.tv", "www.b23.tv"}:
+            return True
+        return bool(
+            re.search(r"(?:^|/)(?:BV[0-9A-Za-z]{10}|av\d+)(?:/|$)", parsed.path, flags=re.I)
+            or re.search(r"/video/(?:BV[0-9A-Za-z]{10}|av\d+)", parsed.path, flags=re.I)
+        )
 
     def normalize_input_url(self, value: str) -> str:
         return self.client.normalize_input_url(value)
@@ -246,9 +255,10 @@ def source_adapters() -> tuple[SourceAdapter, ...]:
     from .douyin import DouyinSourceAdapter
     from .xiaohongshu import XiaohongshuSourceAdapter
     from .zhihu import ZhihuSourceAdapter
-    from .web import GenericWebSourceAdapter
+    from .web import BilibiliDocumentSourceAdapter, GenericWebSourceAdapter
 
     return (
+        BilibiliDocumentSourceAdapter(),
         BilibiliSourceAdapter(),
         YouTubeSourceAdapter(),
         DouyinSourceAdapter(),

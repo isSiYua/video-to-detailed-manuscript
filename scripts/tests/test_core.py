@@ -51,7 +51,13 @@ from vtm_core.douyin import (
     parse_douyin_router_data,
 )
 from vtm_core.models import Frame, InformationUnit, OutlineSection, Paragraph, Segment
-from vtm_core.sources import BilibiliSourceAdapter, SourceAdapter, SourceReference, adapter_for
+from vtm_core.sources import (
+    BilibiliSourceAdapter,
+    SourceAdapter,
+    SourceReference,
+    adapter_by_platform,
+    adapter_for,
+)
 from vtm_core.manuscript import (
     _adjudicate_final_audit,
     _anchor_supported as manuscript_anchor_supported,
@@ -101,11 +107,13 @@ from vtm_core.visual import (
     average_hash,
     describe_if_needed,
     duplicate_distance_threshold,
+    _parse_freeze_intervals,
     extract_useful_frames,
     hash_distance,
     ocr_text_is_usable,
     quality,
     recapture_retained_frames,
+    refine_completion_timestamps,
     semantic_vision_frame_budget,
     vision_priority_ids,
     vision_priority_ids_for_requests,
@@ -123,6 +131,7 @@ from vtm_core.xiaohongshu import (
     parse_xhs_initial_state,
 )
 from vtm_core.web import (
+    BilibiliDocumentSourceAdapter,
     GenericWebInfo,
     GenericWebSourceAdapter,
     _structured_article_metadata,
@@ -1964,6 +1973,35 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(any(name.endswith("assets/001.png") for name in names))
             self.assertFalse(any("/source/" in name for name in names))
 
+    def test_document_task_bundle_uses_source_identity_without_bv_parsing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            vault = Path(temp) / "vault"
+            state = Path(temp) / "state"
+            job = vault / "Sources" / "Documents" / "opus"
+            job.mkdir(parents=True)
+            note = job / "opus.md"
+            note.write_text("正文", encoding="utf-8")
+            with patch.dict(os.environ, {"VTM_STATE_DIR": str(state)}):
+                task = reserve_task(
+                    vault,
+                    url="https://www.bilibili.com/opus/1226076978200707093",
+                    platform="bilibili_opus",
+                    source_kind="document",
+                    source_id="opus-1226076978200707093",
+                    source_key="bilibili_opus:opus-1226076978200707093",
+                )
+                update_task(
+                    vault,
+                    task["task_key"],
+                    status="complete",
+                    job_dir=str(job),
+                    note=str(note),
+                )
+                result = bundle_job(vault, task_id=task["task_key"])
+            archive = Path(str(result["bundle"]))
+            self.assertTrue(archive.is_file())
+            self.assertIn("opus-1226076978200707093-source-manuscript.zip", archive.name)
+
     def test_bundle_refuses_a_registered_directory_outside_the_vault(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -2168,6 +2206,37 @@ class CoreTests(unittest.TestCase):
         self.assertIsInstance(
             adapter_for("https://example.com/article"), GenericWebSourceAdapter
         )
+
+    def test_bilibili_opus_and_column_route_as_documents_not_bv_videos(self):
+        opus = "https://www.bilibili.com/opus/1226076978200707093?spm_id_from=333.1365.0.0"
+        adapter = adapter_for(opus)
+        self.assertIsInstance(adapter, BilibiliDocumentSourceAdapter)
+        self.assertEqual(adapter.source_kind, "document")
+        self.assertEqual(adapter.platform, "bilibili_opus")
+        self.assertEqual(
+            adapter.canonicalize_input(opus),
+            "https://www.bilibili.com/opus/1226076978200707093",
+        )
+        self.assertEqual(
+            adapter.source_id_from_url(opus),
+            "opus-1226076978200707093",
+        )
+        column = adapter_for("https://www.bilibili.com/read/cv123456")
+        self.assertIsInstance(column, BilibiliDocumentSourceAdapter)
+        self.assertEqual(column.source_id_from_url("https://www.bilibili.com/read/cv123456"), "article-123456")
+        self.assertIsInstance(
+            adapter_by_platform("bilibili_opus"),
+            BilibiliDocumentSourceAdapter,
+        )
+
+    def test_bilibili_video_and_wechat_article_keep_separate_routes(self):
+        self.assertIsInstance(
+            adapter_for("https://www.bilibili.com/video/BV1ab411c7DE"),
+            BilibiliSourceAdapter,
+        )
+        wechat = adapter_for("https://mp.weixin.qq.com/s/example-public-article")
+        self.assertIsInstance(wechat, GenericWebSourceAdapter)
+        self.assertNotIsInstance(wechat, BilibiliDocumentSourceAdapter)
 
     def test_youtube_adapter_normalizes_supported_public_urls(self):
         client = YouTubeClient()
@@ -3234,8 +3303,10 @@ class CoreTests(unittest.TestCase):
         client = FakeClient({
             "relevance": "low",
             "content_kind": "ui",
-            "visual_note": None,
-            "keep_image": True,
+            "information_gain": "none",
+            "publish_mode": "drop",
+            "replacement_markdown": None,
+            "display_note": None,
             "confidence": "high",
             "completeness": "complete",
             "information_density": "low",
@@ -3259,8 +3330,9 @@ class CoreTests(unittest.TestCase):
             "relevance": "low",
             "content_kind": "decorative",
             "information_gain": "none",
-            "visual_note": None,
-            "keep_image": False,
+            "publish_mode": "drop",
+            "replacement_markdown": None,
+            "display_note": None,
             "confidence": "high",
             "completeness": "complete",
             "information_density": "low",
@@ -3285,8 +3357,9 @@ class CoreTests(unittest.TestCase):
             "relevance": "high",
             "content_kind": "comparison",
             "information_gain": "none",
-            "visual_note": None,
-            "keep_image": True,
+            "publish_mode": "drop",
+            "replacement_markdown": None,
+            "display_note": None,
             "confidence": "high",
             "completeness": "complete",
             "information_density": "low",
@@ -3309,15 +3382,134 @@ class CoreTests(unittest.TestCase):
             "relevance": "high",
             "content_kind": "text",
             "information_gain": "partial",
-            "visual_note": "Claude Code → 极简；Cursor → 向量索引。",
-            "keep_image": True,
+            "publish_mode": "note_only",
+            "replacement_markdown": "Claude Code → 极简；Cursor → 向量索引。",
+            "display_note": None,
             "confidence": "high",
             "completeness": "complete",
             "information_density": "low",
         })
         enrich_with_visual_evidence(paragraphs, frames, client)
         self.assertFalse(frames[0].keep_image)
-        self.assertIn("Cursor", paragraphs[0].visual_note or "")
+        self.assertEqual(frames[0].publish_mode, "note_only")
+        self.assertIn("Cursor", frames[0].replacement_markdown)
+        self.assertIsNone(paragraphs[0].visual_note)
+
+    def test_talking_head_text_overlay_becomes_text_without_portrait_or_subtitle(self):
+        paragraph = Paragraph(
+            ["s1"],
+            "作者建议把明确的要求交给模型执行。",
+            30,
+            45,
+            heading="四个象限详解",
+            subheading="象限一：我知道，AI也知道",
+        )
+        frozen = (
+            paragraph.text,
+            paragraph.heading,
+            paragraph.subheading,
+            list(paragraph.source_ids),
+        )
+        portrait = Frame(
+            37,
+            "/tmp/talking-head.png",
+            ["s1"],
+            ocr_text="1. 共识区 让 AI 执行",
+            ocr_confidence=91,
+            vision_description=(
+                "画面为短视频平台视频截图，人物口述，含叠加文字与字幕。"
+                "顶部标题为 1. 共识区 让 AI 执行。"
+                "无代码、公式、表格、图表、流程图或结构图。"
+            ),
+        )
+        client = FakeClient({
+            "relevance": "high",
+            "content_kind": "text",
+            "information_gain": "partial",
+            "publish_mode": "image_with_note",
+            "replacement_markdown": None,
+            "display_note": "标题显示“1. 共识区 让 AI 执行”；字幕为“全部都跟他说”。",
+            "confidence": "high",
+            "completeness": "complete",
+            "information_density": "low",
+        })
+
+        self.assertEqual(enrich_with_visual_evidence([paragraph], [portrait], client), [])
+        self.assertEqual(portrait.publish_mode, "note_only")
+        self.assertFalse(portrait.keep_image)
+        self.assertEqual(portrait.replacement_markdown, "1. 共识区 让 AI 执行")
+        self.assertNotIn("字幕", portrait.replacement_markdown)
+        self.assertNotIn("全部都跟他说", portrait.replacement_markdown)
+        self.assertEqual(
+            (
+                paragraph.text,
+                paragraph.heading,
+                paragraph.subheading,
+                paragraph.source_ids,
+            ),
+            frozen,
+        )
+
+    def test_talking_head_repeated_overlay_drops_but_diagram_remains_image(self):
+        paragraph = Paragraph(
+            ["s1"],
+            "本节标题已经写明：共识区让 AI 执行。",
+            20,
+            45,
+            heading="四个象限详解",
+            subheading="象限一：共识区",
+        )
+        portrait = Frame(
+            37,
+            "/tmp/talking-head.png",
+            ["s1"],
+            ocr_text="1. 共识区 让 AI 执行",
+            ocr_confidence=93,
+            vision_description=(
+                "画面为纯文字加人物实拍的视频帧，顶部标题和字幕叠加在人物画面。"
+                "未出现流程图、结构图、图表、表格、代码或公式。"
+            ),
+        )
+        diagram = Frame(
+            28,
+            "/tmp/quadrants.png",
+            ["s1"],
+            ocr_text="我知道 AI知道 共识区 隐藏区 盲区 未知区",
+            ocr_confidence=95,
+            vision_description="四象限结构图，坐标轴和四个区域关系完整可见。",
+        )
+        client = FakeClient({"items": [
+            {
+                "item_id": "v001",
+                "relevance": "high",
+                "content_kind": "text",
+                "information_gain": "partial",
+                "publish_mode": "image_with_note",
+                "replacement_markdown": None,
+                "display_note": "标题显示“1. 共识区 让 AI 执行”。",
+                "confidence": "high",
+                "completeness": "complete",
+                "information_density": "low",
+            },
+            {
+                "item_id": "v002",
+                "relevance": "high",
+                "content_kind": "diagram",
+                "information_gain": "substantial",
+                "publish_mode": "image_only",
+                "replacement_markdown": None,
+                "display_note": None,
+                "confidence": "high",
+                "completeness": "complete",
+                "information_density": "high",
+            },
+        ]})
+
+        self.assertEqual(enrich_with_visual_evidence([paragraph], [portrait, diagram], client), [])
+        self.assertEqual(portrait.publish_mode, "drop")
+        self.assertFalse(portrait.keep_image)
+        self.assertEqual(diagram.publish_mode, "image_only")
+        self.assertTrue(diagram.keep_image)
 
     def test_short_transcribed_text_slide_does_not_keep_image_for_cautious_partial_label(self):
         paragraphs = [Paragraph(["s1"], "精确搜索不存在语义漂移。", 0, 4)]
@@ -3331,15 +3523,17 @@ class CoreTests(unittest.TestCase):
             "relevance": "high",
             "content_kind": "text",
             "information_gain": "partial",
-            "visual_note": "不存在语义漂移的问题。",
-            "keep_image": True,
+            "publish_mode": "note_only",
+            "replacement_markdown": "不存在语义漂移的问题。",
+            "display_note": None,
             "confidence": "high",
             "completeness": "partial",
             "information_density": "low",
         })
         enrich_with_visual_evidence(paragraphs, frames, client)
-        self.assertFalse(frames[0].keep_image)
-        self.assertIn("语义漂移", paragraphs[0].visual_note or "")
+        self.assertTrue(frames[0].keep_image)
+        self.assertEqual(frames[0].publish_mode, "image_only")
+        self.assertIsNone(paragraphs[0].visual_note)
 
     def test_relevant_screen_without_complete_transcription_keeps_original_image(self):
         paragraphs = [Paragraph(["s1"], "UP 主正在展示配置界面。", 0, 4)]
@@ -3356,8 +3550,10 @@ class CoreTests(unittest.TestCase):
             {
                 "relevance": "high",
                 "content_kind": "ui",
-                "visual_note": None,
-                "keep_image": True,
+                "information_gain": "substantial",
+                "publish_mode": "image_only",
+                "replacement_markdown": None,
+                "display_note": None,
                 "confidence": "medium",
                 "completeness": "partial",
                 "information_density": "high",
@@ -3402,8 +3598,10 @@ class CoreTests(unittest.TestCase):
                                 "item_id": item["item_id"],
                                 "relevance": "high",
                                 "content_kind": "ui",
-                                "visual_note": "画面显示对应的操作界面。",
-                                "keep_image": True,
+                                "information_gain": "substantial",
+                                "publish_mode": "image_only",
+                                "replacement_markdown": None,
+                                "display_note": None,
                                 "confidence": "high",
                                 "completeness": "partial",
                                 "information_density": "high",
@@ -3541,8 +3739,10 @@ class CoreTests(unittest.TestCase):
         client = FakeClient({
             "relevance": "high",
             "content_kind": "text",
-            "visual_note": "画面显示完整标题：E238 Harness 时代 AI-First。",
-            "keep_image": False,
+            "information_gain": "partial",
+            "publish_mode": "note_only",
+            "replacement_markdown": "完整标题：E238 Harness 时代 AI-First。",
+            "display_note": None,
             "confidence": "high",
             "completeness": "complete",
             "information_density": "low",
@@ -3550,7 +3750,8 @@ class CoreTests(unittest.TestCase):
         warnings = enrich_with_visual_evidence(paragraphs, frames, client)
         self.assertEqual(warnings, [])
         self.assertEqual(paragraphs[0].text, "UP 主只说推荐这期。")
-        self.assertIn("E238", paragraphs[0].visual_note or "")
+        self.assertIn("E238", frames[0].replacement_markdown)
+        self.assertIsNone(paragraphs[0].visual_note)
         self.assertFalse(frames[0].keep_image)
 
     def test_complete_low_density_text_deterministically_replaces_image(self):
@@ -3566,15 +3767,18 @@ class CoreTests(unittest.TestCase):
         client = FakeClient({
             "relevance": "high",
             "content_kind": "text",
-            "visual_note": "`VTM_FINAL_VISUAL_HEIGHT=1080`",
-            "keep_image": True,
+            "information_gain": "partial",
+            "publish_mode": "note_only",
+            "replacement_markdown": "`VTM_FINAL_VISUAL_HEIGHT=1080`",
+            "display_note": None,
             "confidence": "high",
             "completeness": "complete",
             "information_density": "low",
         })
         enrich_with_visual_evidence(paragraphs, frames, client)
         self.assertFalse(frames[0].keep_image)
-        self.assertIn("1080", paragraphs[0].visual_note or "")
+        self.assertIn("1080", frames[0].replacement_markdown)
+        self.assertIsNone(paragraphs[0].visual_note)
 
     def test_redundant_complete_simple_text_without_unique_note_removes_image(self):
         paragraphs = [Paragraph(["s1"], "课程共四个多小时，配有近 200 页讲义。", 0, 4)]
@@ -3589,8 +3793,10 @@ class CoreTests(unittest.TestCase):
         client = FakeClient({
             "relevance": "high",
             "content_kind": "text",
-            "visual_note": None,
-            "keep_image": True,
+            "information_gain": "none",
+            "publish_mode": "drop",
+            "replacement_markdown": None,
+            "display_note": None,
             "confidence": "high",
             "completeness": "complete",
             "information_density": "low",
@@ -3611,8 +3817,10 @@ class CoreTests(unittest.TestCase):
         client = FakeClient({
             "relevance": "high",
             "content_kind": "text",
-            "visual_note": "画面提示词要求每天抓取最近 24 小时的 AI 新闻。",
-            "keep_image": False,
+            "information_gain": "substantial",
+            "publish_mode": "image_only",
+            "replacement_markdown": None,
+            "display_note": None,
             "confidence": "high",
             "completeness": "partial",
             "information_density": "high",
@@ -3634,8 +3842,10 @@ class CoreTests(unittest.TestCase):
         client = FakeClient({
             "relevance": "high",
             "content_kind": "ui",
-            "visual_note": "画面显示按钮 cvs 和韩文网站名称。",
-            "keep_image": True,
+            "information_gain": "partial",
+            "publish_mode": "image_only",
+            "replacement_markdown": None,
+            "display_note": None,
             "confidence": "medium",
             "completeness": "partial",
             "information_density": "high",
@@ -3675,7 +3885,7 @@ class CoreTests(unittest.TestCase):
         plan = plan_frame_evidence(paragraphs, [weaker, stronger])
         self.assertEqual(list(plan), [1])
         self.assertIs(plan[1], stronger)
-        self.assertIsNone(paragraphs[0].visual_note)
+        self.assertEqual(paragraphs[0].visual_note, "较弱截图的识别文字")
         self.assertEqual(weaker.extracted_markdown, "")
 
     def test_common_asr_product_and_csv_reversals_are_normalized(self):
@@ -4045,15 +4255,15 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(groups[1], [frames[1]])
         self.assertEqual(groups[2], [frames[2]])
 
-    def test_multiple_complete_text_slides_merge_as_copyable_notes_without_images(self):
+    def test_multiple_complete_text_slides_publish_as_separate_frame_notes(self):
         paragraphs = [Paragraph(["s1"], "作者依次展示两页名单。", 0, 20)]
         frames = [
-            Frame(5, "/tmp/a.png", ["s1"], paragraph_index=0, keep_image=False, extracted_markdown="- A\n- B", ahash="0" * 64),
-            Frame(15, "/tmp/b.png", ["s1"], paragraph_index=0, keep_image=False, extracted_markdown="- C\n- D", ahash="f" * 64),
+            Frame(5, "/tmp/a.png", ["s1"], paragraph_index=0, publish_mode="note_only", replacement_markdown="- A\n- B", keep_image=False, ahash="0" * 64),
+            Frame(15, "/tmp/b.png", ["s1"], paragraph_index=0, publish_mode="note_only", replacement_markdown="- C\n- D", keep_image=False, ahash="f" * 64),
         ]
         groups = plan_frame_evidence_groups(paragraphs, frames)
         self.assertEqual(len(groups[0]), 2)
-        self.assertEqual(paragraphs[0].visual_note, "- A\n- B\n\n- C\n- D")
+        self.assertIsNone(paragraphs[0].visual_note)
 
     def test_markdown_uses_relative_assets(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -4090,14 +4300,12 @@ class CoreTests(unittest.TestCase):
                     "作者列出了自己喜欢的 AI 播客。",
                     0,
                     4,
-                    visual_note="十字路口 Crossing、硅谷 101、OnBoard!。",
                 ),
                 Paragraph(
                     ["s2"],
                     "作者展示了每天抓取最近 24 小时 AI 新闻的 Automation 提示词。",
                     4,
                     8,
-                    visual_note="画面还能确认新闻来源、关键词和分栏数量设置。",
                 ),
             ]
             frames = [
@@ -4107,6 +4315,8 @@ class CoreTests(unittest.TestCase):
                     ["s1"],
                     paragraph_index=0,
                     content_kind="list",
+                    publish_mode="note_only",
+                    replacement_markdown="十字路口 Crossing、硅谷 101、OnBoard!。",
                     keep_image=False,
                     evidence_confidence="high",
                     evidence_completeness="complete",
@@ -4118,6 +4328,7 @@ class CoreTests(unittest.TestCase):
                     ["s2"],
                     paragraph_index=1,
                     content_kind="ui",
+                    publish_mode="image_only",
                     keep_image=True,
                     evidence_confidence="high",
                     evidence_completeness="partial",
@@ -4152,13 +4363,13 @@ class CoreTests(unittest.TestCase):
             compose_markdown(
                 note,
                 {"title": "标题", "url": "https://example.invalid", "part": 1},
-                [Paragraph(["s1"], "口述正文。", 0, 2, visual_note="画面显示完整单集标题。")],
-                [Frame(1, str(image), ["s1"], paragraph_index=0, vision_description="完整单集标题", extracted_markdown="完整单集标题")],
+                [Paragraph(["s1"], "口述正文。", 0, 2)],
+                [Frame(1, str(image), ["s1"], paragraph_index=0, vision_description="完整单集标题", publish_mode="image_with_note", display_note="- 完整单集编号为 E238")],
             )
             rendered = note.read_text(encoding="utf-8")
             self.assertIn("[!info] 画面补充", rendered)
             self.assertLess(rendered.index("口述正文"), rendered.index("画面补充"))
-            self.assertLess(rendered.index("画面补充"), rendered.index("assets/001.png"))
+            self.assertLess(rendered.index("assets/001.png"), rendered.index("画面补充"))
 
     def test_uncertain_vision_description_is_not_used_as_image_alt_text(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -4194,8 +4405,8 @@ class CoreTests(unittest.TestCase):
             image = assets / "001.png"
             image.write_bytes(b"png")
             note = root / "note.md"
-            paragraph = Paragraph(["s1"], "口述正文。", 0, 2, visual_note="- 节目 A\n- 节目 B")
-            frame = Frame(1, str(image), ["s1"], paragraph_index=0, content_kind="list", keep_image=False)
+            paragraph = Paragraph(["s1"], "口述正文。", 0, 2)
+            frame = Frame(1, str(image), ["s1"], paragraph_index=0, content_kind="list", publish_mode="note_only", replacement_markdown="- 节目 A\n- 节目 B", keep_image=False)
             compose_markdown(
                 note,
                 {"title": "标题", "url": "https://example.invalid", "part": 1},
@@ -4213,12 +4424,275 @@ class CoreTests(unittest.TestCase):
         client = FakeClient({
             "relevance": "high",
             "content_kind": "formula",
-            "visual_note": "$$E=mc^2$$",
-            "keep_image": False,
+            "information_gain": "partial",
+            "publish_mode": "note_only",
+            "replacement_markdown": "$$E=mc^2$$",
+            "display_note": None,
             "confidence": "low",
         })
         enrich_with_visual_evidence(paragraphs, frames, client)
         self.assertTrue(frames[0].keep_image)
+
+    def test_freezedetect_parser_closes_stable_interval_at_window_end(self):
+        log = "\n".join([
+            "lavfi.freezedetect.freeze_start: 1.25",
+            "lavfi.freezedetect.freeze_end: 4.5",
+            "lavfi.freezedetect.freeze_start: 6.0",
+        ])
+        self.assertEqual(
+            _parse_freeze_intervals(log, window_start=10, window_duration=8),
+            [(11.25, 14.5), (16.0, 18)],
+        )
+
+    def test_progressive_candidate_moves_to_latest_complete_stable_state(self):
+        requests = [{
+            "time_start": 0,
+            "time_end": 10,
+            "purpose": "读取逐步出现的 PPT 项目",
+            "expected_kind": "text",
+        }]
+        with patch(
+            "vtm_core.visual.detect_stable_intervals",
+            return_value=[(0.8, 3.0), (5.0, 9.5)],
+        ):
+            refined, metadata = refine_completion_timestamps(
+                Path("video.mp4"), [(0.45, 6.0)], [], requests, 10
+            )
+        self.assertEqual(refined, [(9.35, 6.0)])
+        self.assertEqual(metadata["stable_completion_adjusted_count"], 1)
+
+    def test_completion_timing_uses_midpoint_or_scene_rear_fallback(self):
+        short_request = [{
+            "time_start": 0,
+            "time_end": 3,
+            "purpose": "读取静态文字页",
+            "expected_kind": "text",
+        }]
+        ordinary_request = [{
+            "time_start": 0,
+            "time_end": 10,
+            "purpose": "读取完整流程图",
+            "expected_kind": "diagram",
+        }]
+        with patch("vtm_core.visual.detect_stable_intervals", return_value=[]):
+            short, _ = refine_completion_timestamps(
+                Path("video.mp4"), [(0.45, 6.0)], [], short_request, 3
+            )
+            ordinary, _ = refine_completion_timestamps(
+                Path("video.mp4"), [(0.45, 6.0)], [], ordinary_request, 10
+            )
+        self.assertEqual(short[0][0], 1.5)
+        self.assertEqual(ordinary[0][0], 8.0)
+
+    def test_completion_timing_failure_or_later_original_keeps_original(self):
+        requests = [{
+            "time_start": 0,
+            "time_end": 10,
+            "purpose": "读取完整页面",
+            "expected_kind": "text",
+        }]
+        with patch(
+            "vtm_core.visual.detect_stable_intervals",
+            side_effect=RuntimeError("ffmpeg unavailable"),
+        ):
+            failed, _ = refine_completion_timestamps(
+                Path("video.mp4"), [(0.45, 6.0)], [], requests, 10
+            )
+        with patch("vtm_core.visual.detect_stable_intervals", return_value=[]):
+            later, _ = refine_completion_timestamps(
+                Path("video.mp4"), [(9.0, 6.0)], [], requests, 10
+            )
+        self.assertEqual(failed[0][0], 0.45)
+        self.assertEqual(later[0][0], 9.0)
+
+    def test_dynamic_and_comparison_requests_never_move_to_scene_end(self):
+        requests = [
+            {
+                "time_start": 0,
+                "time_end": 10,
+                "purpose": "机器人动态模拟的关键瞬间",
+                "expected_kind": "ui",
+            },
+            {
+                "time_start": 20,
+                "time_end": 30,
+                "purpose": "保留前后两个状态",
+                "expected_kind": "comparison",
+            },
+        ]
+        candidates = [(2.0, 6.0), (22.0, 6.0), (28.0, 6.0)]
+        with patch("vtm_core.visual.detect_stable_intervals") as detector:
+            refined, _ = refine_completion_timestamps(
+                Path("video.mp4"), candidates, [], requests, 30
+            )
+        self.assertEqual(refined, candidates)
+        detector.assert_not_called()
+
+    def test_publish_mode_format_error_falls_back_to_image_only(self):
+        paragraphs = [Paragraph(["s1"], "正文保持不变。", 0, 4)]
+        frame = Frame(
+            2, "/tmp/diagram.png", ["s1"],
+            vision_description="包含多个节点的复杂流程图。",
+        )
+        client = FakeClient({
+            "relevance": "high",
+            "content_kind": "diagram",
+            "information_gain": "substantial",
+            "confidence": "high",
+            "completeness": "complete",
+            "information_density": "high",
+        })
+        warnings = enrich_with_visual_evidence(paragraphs, [frame], client)
+        self.assertTrue(warnings)
+        self.assertEqual(frame.publish_mode, "image_only")
+        self.assertTrue(frame.keep_image)
+        self.assertEqual(frame.display_note, "")
+
+    def test_image_with_note_accepts_two_short_points_and_rejects_long_or_repeated_note(self):
+        paragraph = Paragraph(["s1"], "正文只介绍模型输出。", 0, 4)
+        good = Frame(1, "/tmp/good.png", ["s1"], vision_description="复杂结果图包含两个隐藏参数。")
+        good_client = FakeClient({
+            "relevance": "high",
+            "content_kind": "chart",
+            "information_gain": "partial",
+            "publish_mode": "image_with_note",
+            "replacement_markdown": None,
+            "display_note": "阈值标记为 0.45\n虚线代表人工基准",
+            "confidence": "high",
+            "completeness": "partial",
+            "information_density": "high",
+        })
+        self.assertEqual(enrich_with_visual_evidence([paragraph], [good], good_client), [])
+        self.assertEqual(good.publish_mode, "image_with_note")
+        self.assertEqual(good.display_note.count("\n"), 1)
+
+        bad = Frame(2, "/tmp/bad.png", ["s1"], vision_description="复杂结果图包含多项信息。")
+        bad_client = FakeClient({
+            "relevance": "high",
+            "content_kind": "chart",
+            "information_gain": "partial",
+            "publish_mode": "image_with_note",
+            "replacement_markdown": None,
+            "display_note": "正文只介绍模型输出。",
+            "confidence": "high",
+            "completeness": "partial",
+            "information_density": "high",
+        })
+        warnings = enrich_with_visual_evidence([paragraph], [bad], bad_client)
+        self.assertTrue(warnings)
+        self.assertEqual(bad.publish_mode, "image_only")
+        self.assertEqual(bad.display_note, "")
+
+        too_many = Frame(3, "/tmp/many.png", ["s1"], vision_description="复杂结果图包含三项细节。")
+        too_many_client = FakeClient({
+            "relevance": "high",
+            "content_kind": "chart",
+            "information_gain": "partial",
+            "publish_mode": "image_with_note",
+            "replacement_markdown": None,
+            "display_note": "阈值为 0.45\n虚线是基准\n圆点是实测值",
+            "confidence": "high",
+            "completeness": "partial",
+            "information_density": "high",
+        })
+        self.assertTrue(enrich_with_visual_evidence([paragraph], [too_many], too_many_client))
+        self.assertEqual(too_many.publish_mode, "image_only")
+
+    def test_drop_and_image_only_emit_no_info(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            assets = root / "assets"
+            assets.mkdir()
+            dropped = assets / "dropped.png"
+            retained = assets / "retained.png"
+            dropped.write_bytes(b"drop")
+            retained.write_bytes(b"keep")
+            frames = [
+                Frame(1, str(dropped), ["s1"], paragraph_index=0, publish_mode="drop", keep_image=False),
+                Frame(2, str(retained), ["s1"], paragraph_index=0, publish_mode="image_only", keep_image=True),
+            ]
+            note = root / "note.md"
+            compose_markdown(
+                note,
+                {"title": "互斥发布", "url": "https://example.invalid", "part": 1},
+                [Paragraph(["s1"], "正文。", 0, 3)],
+                frames,
+            )
+            rendered = note.read_text(encoding="utf-8")
+            self.assertNotIn("dropped.png", rendered)
+            self.assertIn("retained.png", rendered)
+            self.assertNotIn("[!info] 画面补充", rendered)
+            self.assertFalse(dropped.exists())
+            self.assertTrue(retained.exists())
+
+    def test_each_frame_publishes_its_own_info_without_paragraph_aggregation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            assets = root / "assets"
+            assets.mkdir()
+            first = assets / "first.png"
+            second = assets / "second.png"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            paragraph = Paragraph(["s1"], "正文。", 0, 10)
+            frames = [
+                Frame(2, str(first), ["s1"], paragraph_index=0, publish_mode="image_with_note", display_note="- 参数 A 为 10"),
+                Frame(8, str(second), ["s1"], paragraph_index=0, publish_mode="image_with_note", display_note="- 参数 B 为 20", ahash="f" * 64),
+            ]
+            note = root / "note.md"
+            compose_markdown(
+                note,
+                {"title": "逐帧说明", "url": "https://example.invalid", "part": 1},
+                [paragraph],
+                frames,
+            )
+            rendered = note.read_text(encoding="utf-8")
+            self.assertEqual(rendered.count("[!info] 画面补充"), 2)
+            self.assertLess(rendered.index("first.png"), rendered.index("参数 A"))
+            self.assertLess(rendered.index("second.png"), rendered.index("参数 B"))
+            self.assertIsNone(paragraph.visual_note)
+
+    def test_visual_publication_never_mutates_body_fields(self):
+        paragraph = Paragraph(
+            ["s1", "s2"],
+            "正文、事实和结构保持不变。",
+            0,
+            4,
+            heading="固定章节",
+            subheading="固定小节",
+        )
+        frozen = (
+            paragraph.text,
+            paragraph.heading,
+            paragraph.subheading,
+            list(paragraph.source_ids),
+        )
+        frame = Frame(
+            2, "/tmp/text.png", ["s1"],
+            ocr_text="额外可复制的配置值 ABC=1",
+            ocr_confidence=95,
+        )
+        client = FakeClient({
+            "relevance": "high",
+            "content_kind": "text",
+            "information_gain": "partial",
+            "publish_mode": "note_only",
+            "replacement_markdown": "`ABC=1`",
+            "display_note": None,
+            "confidence": "high",
+            "completeness": "complete",
+            "information_density": "low",
+        })
+        enrich_with_visual_evidence([paragraph], [frame], client)
+        self.assertEqual(
+            (
+                paragraph.text,
+                paragraph.heading,
+                paragraph.subheading,
+                paragraph.source_ids,
+            ),
+            frozen,
+        )
 
     def test_delete_is_soft_and_restore_uses_stable_history_id(self):
         with tempfile.TemporaryDirectory() as temp, patch.dict(
@@ -4689,6 +5163,19 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(popen.call_args.kwargs["start_new_session"])
             self.assertEqual(result["status"], "submitted")
             self.assertTrue(result["chat_session_released"])
+            self.assertEqual(
+                result["assistant_reply"],
+                "已提交后台处理，任务编号将在第一条进度中显示。",
+            )
+            self.assertEqual(
+                result["assistant_reply_contract"],
+                "return_assistant_reply_verbatim_and_stop",
+            )
+            self.assertEqual(result["progress_delivery"], "out_of_band_only")
+            self.assertFalse(result["progress_in_this_result"])
+            self.assertNotIn("task_key", result)
+            self.assertNotIn("title", result)
+            self.assertNotIn("note", result)
 
     def test_bulk_delete_uses_stable_plan_and_protects_active_jobs(self):
         with tempfile.TemporaryDirectory() as temp, patch.dict(

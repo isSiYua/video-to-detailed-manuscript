@@ -37,7 +37,7 @@ USER_AGENT = (
 )
 TRACKING_QUERY_KEYS = {
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-    "spm", "from", "source", "share_token",
+    "spm", "spm_id_from", "from", "source", "share_token",
 }
 EXCLUDED_TAGS = {
     "script", "style", "noscript", "template", "svg", "canvas", "form",
@@ -715,3 +715,83 @@ class GenericWebSourceAdapter:
 
     def folder_marker(self, inspected: GenericWebInfo) -> str:
         return f"WEB-{inspected.source_id[:12]}"
+
+
+_BILIBILI_DOCUMENT_HOSTS = {"bilibili.com", "www.bilibili.com", "m.bilibili.com"}
+_BILIBILI_OPUS_RE = re.compile(r"^/opus/(\d+)(?:/|$)")
+_BILIBILI_READ_RE = re.compile(r"^/read/(?:cv)?(\d+)(?:/|$)", flags=re.I)
+
+
+def bilibili_document_target(value: str) -> tuple[str, str] | None:
+    """Identify public Bilibili opus/dynamic and legacy column article URLs."""
+    text = str(value or "").strip()
+    if "://" not in text:
+        text = "https://" + text
+    parsed = urllib.parse.urlparse(text)
+    if (parsed.hostname or "").lower() not in _BILIBILI_DOCUMENT_HOSTS:
+        return None
+    opus = _BILIBILI_OPUS_RE.search(parsed.path)
+    if opus:
+        return "opus", opus.group(1)
+    article = _BILIBILI_READ_RE.search(parsed.path)
+    if article:
+        return "article", article.group(1)
+    if parsed.path.rstrip("/").lower() == "/read/mobile":
+        article_id = urllib.parse.parse_qs(parsed.query).get("id", [""])[0]
+        if str(article_id).isdigit():
+            return "article", str(article_id)
+    return None
+
+
+class BilibiliDocumentSourceAdapter(GenericWebSourceAdapter):
+    """Treat public Bilibili opus/column pages as documents, never as BV videos."""
+
+    platform = "bilibili_opus"
+    source_kind = "document"
+
+    def can_handle(self, value: str) -> bool:
+        return bilibili_document_target(value) is not None
+
+    def normalize_input_url(self, value: str) -> str:
+        target = bilibili_document_target(value)
+        if target is None:
+            raise ValueError("只支持 Bilibili opus 动态或专栏文章 URL")
+        kind, source_id = target
+        if kind == "opus":
+            return f"https://www.bilibili.com/opus/{source_id}"
+        return f"https://www.bilibili.com/read/cv{source_id}"
+
+    def canonicalize_input(self, value: str) -> str:
+        return self.normalize_input_url(value)
+
+    def source_id_from_url(self, value: str) -> str:
+        target = bilibili_document_target(value)
+        if target is None:
+            raise ValueError("只支持 Bilibili opus 动态或专栏文章 URL")
+        kind, source_id = target
+        return f"{kind}-{source_id}"
+
+    def inspect(self, value: str, selector: int | None = None) -> GenericWebInfo:
+        inspected = super().inspect(self.canonicalize_input(value), selector)
+        stable_id = self.source_id_from_url(inspected.url)
+        return GenericWebInfo(
+            inspected.url,
+            stable_id,
+            inspected.title,
+            inspected.author,
+            inspected.site_name,
+            inspected.published_at,
+            inspected.extraction_engine,
+            inspected.segments,
+            inspected.images,
+        )
+
+    def context(self, inspected: GenericWebInfo) -> str:
+        creator = f"；作者：{inspected.author}" if inspected.author else ""
+        published = f"；发布时间：{inspected.published_at}" if inspected.published_at else ""
+        return f"来源类型：Bilibili 图文文章；标题：{inspected.title}{creator}{published}"
+
+    def folder_marker(self, inspected: GenericWebInfo) -> str:
+        kind, source_id = inspected.source_id.split("-", 1)
+        prefix = "OPUS" if kind == "opus" else "CV"
+        return f"BILI-{prefix}-{source_id}"
