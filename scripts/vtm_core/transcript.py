@@ -288,28 +288,148 @@ def exact_anchors(segments: Iterable[Segment]) -> list[str]:
     return anchors
 
 
-VISUAL_EVIDENCE_PROMPT = """根据画面 OCR/视觉描述，为对应口述提取可核验的画面细节，并判断图片是否不可替代。
-只使用画面中确实可见的信息；不要推断、评价、扩展背景知识或重复口述已有内容。
-先判断画面是否直接支撑当前口述。只有画面展示了讲述者正在操作、列举、核验或强调的内容时 relevance=high。普通过渡画面、无关页面细节或只是时间上接近时 relevance=low，visual_note=null。
+VISUAL_EVIDENCE_PROMPT = """根据画面 OCR/视觉描述，为每个视觉项选择一种且仅一种公开发布方式。
+只使用画面中确实可见的信息，并与 spoken_paragraph 比较。不要推断、评价、扩展背景知识，不要重复正文。
 
-同时比较 spoken_paragraph 与画面：information_gain=none 表示画面只是重复正文、字幕、标题或装饰；partial 表示增加少量可复制细节；substantial 表示视觉结构、原图或密集内容无法由正文替代。程序会直接丢弃 relevance=low、decorative 或 information_gain=none 的画面。
+四种 publish_mode：
+- drop：无关、装饰、纯人物、重复字幕/标题、水印，或没有新增学习价值；不显示图片和说明。
+- note_only：简单文字、名单、表格、代码或公式能够高置信、完整且结构可靠地转成 Markdown；只显示 replacement_markdown，不显示图片。
+- image_only：流程图、架构图、图表、空间关系、复杂 UI、论文原图、视觉对比，或任何不确定/不完整内容；保留图片，不输出说明。
+- image_with_note：图片必须保留，且正文遗漏了一项重要、单看图片不易注意的可见信息；保留图片并输出 display_note。
 
-分类与输出规则：
-- text/list：完整转成普通文字或 Markdown 列表；只有画面简单、所有可读信息均已转录且可证明无损时，keep_image=false。
-- table：完整转成 Markdown 表格；结构和数值都可靠时 keep_image=false。
-- code：保留语言、缩进和符号，输出 fenced code block；识别可靠时 keep_image=false。
-- formula：输出可复制的 LaTeX，行内用 $...$、独立公式用 $$...$$；识别可靠时 keep_image=false。
-- diagram/chart/process/ui/paper_figure/comparison：只有空间关系、走势、操作状态或原始图形确实承载正文没有的内容时才使用这些分类并 keep_image=true；visual_note 只写与口述直接相关的可见细节，不列举讲述者未关注的通用界面按钮。单个箭头、两个标签、简单图标加标题不算不可替代的流程图或架构图；完整转成文字后归为 text/comparison，information_gain=none 或 partial。
-- decorative：人物卡通、库存插画、头像、水印、背景装饰、重复字幕/标题、只用于美观的图标，或“简单标题 + 装饰插画”且正文已经表达全部信息。必须 relevance=low、information_gain=none、visual_note=null、keep_image=false。
-- other：不确定时 keep_image=true。
+display_note 规则：最多一至两条短重点；只写正文没有表达的事实。不得描述左/右/顶部/底部等布局，不得写水印、页码、播放控件、字幕颜色或装饰，不得复述正文，不得写“这说明”“价值在于”“适合用于”“由此可见”等编辑者推论。复杂图片默认 image_only，不要机械复述整张图。
 
-必须额外判断两项：
-- completeness=complete 仅表示 visual_note 已覆盖画面中全部有用、可读信息；只提取标题、关键词、部分条目或摘要时必须是 partial。
-- information_density=high 表示长提示词、长文章、多张卡片、多列列表、密集界面等信息丰富画面。此类画面即使提取了重点也保留原图。
+replacement_markdown 只用于 note_only，必须完整可靠：表格保留行列，代码使用 fenced code block，公式使用 LaTeX。display_note 只用于 image_with_note。其他模式对应字段必须为 null。
 
-OCR 噪声较大、内容被截断、OCR 与视觉描述不一致、代码缩进不明、公式符号不确定、表格关系不清时，confidence=low 或 completeness=partial，且 keep_image=true，不能强行转写。
-只有 confidence=high、completeness=complete 且底层 OCR 质量足以交叉验证时，visual_note 才可能进入最终文稿。partial/unknown 或 medium/low 只用于决定保留原图，不得输出为可复制文字；不要为了填充 visual_note 而猜测不可读内容。
-输入是带 item_id 的数组。严格返回 JSON：{"items":[{"item_id":"v001","relevance":"high|low","content_kind":"text|list|table|code|formula|diagram|chart|process|ui|paper_figure|comparison|decorative|other","information_gain":"none|partial|substantial","visual_note":"Markdown 或 null","keep_image":true,"confidence":"high|medium|low","completeness":"complete|partial|unknown","information_density":"low|medium|high"}]}。每个输入 item_id 恰好返回一次。"""
+短视频中的自拍、人物口述或演讲画面，如果视觉价值仅来自少量叠加标题/关键词/字幕，不得选择 image_only 或 image_with_note：叠加文字已被 nearby_heading、nearby_subheading 或 spoken_paragraph 表达时选择 drop；确有少量新增且可完整转写时选择 note_only。人物脸部、手势、衣着、麦克风、作者水印和逐句字幕本身不构成必须保留图片的理由。只有人物正在做实物演示、实验、关键动作或前后对比，且该视觉状态不可由文字替代时，才保留图片。
+
+同时返回审计字段：relevance=high 仅表示直接支撑当前口述；information_gain=none 表示重复/装饰，partial 表示少量新增，substantial 表示视觉结构或密集内容不可由正文替代；completeness=complete 仅表示全部有用可读信息已覆盖。OCR 噪声、截断、冲突、缩进/符号/表格关系不清时必须选择 image_only，不得猜测。
+
+输入是带 item_id 的数组。严格返回 JSON：{"items":[{"item_id":"v001","relevance":"high|low","content_kind":"text|list|table|code|formula|diagram|chart|process|ui|paper_figure|comparison|decorative|other","information_gain":"none|partial|substantial","publish_mode":"drop|note_only|image_only|image_with_note","replacement_markdown":"完整 Markdown 或 null","display_note":"一至两条短重点或 null","confidence":"high|medium|low","completeness":"complete|partial|unknown","information_density":"low|medium|high"}]}。每个输入 item_id 恰好返回一次。"""
+
+PUBLISH_MODES = {"drop", "note_only", "image_only", "image_with_note"}
+TEXT_REPLACEABLE_KINDS = {"text", "list", "table", "code", "formula"}
+DISPLAY_NOTE_FORBIDDEN_RE = re.compile(
+    r"(?:左边|右边|左侧|右侧|顶部|底部|上方|下方|水印|页码|播放控件|字幕颜色|布局|"
+    r"这说明|其价值在于|价值在于|适合用于|适合用来|形成互补|由此可见)"
+)
+
+
+def _normalized_visible_text(text: str) -> str:
+    return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", text).lower()
+
+
+def _substantially_repeats_body(note: str, body: str) -> bool:
+    normalized_note = _normalized_visible_text(note)
+    normalized_body = _normalized_visible_text(body)
+    if len(normalized_note) < 6:
+        return True
+    if normalized_note in normalized_body:
+        return True
+    note_pairs = {normalized_note[index : index + 2] for index in range(len(normalized_note) - 1)}
+    body_pairs = {normalized_body[index : index + 2] for index in range(len(normalized_body) - 1)}
+    return bool(note_pairs) and len(note_pairs & body_pairs) / len(note_pairs) >= 0.82
+
+
+def _validated_display_note(value: object, body: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("image_with_note omitted display_note")
+    raw_lines = [
+        re.sub(r"^\s*(?:[-*•]|\d+[.)、])\s*", "", line).strip()
+        for line in value.splitlines()
+        if line.strip()
+    ]
+    if not 1 <= len(raw_lines) <= 2:
+        raise ValueError("display_note must contain one or two points")
+    if any(len(_normalized_visible_text(line)) > 80 for line in raw_lines):
+        raise ValueError("display_note point is too long")
+    rendered = "\n".join(f"- {line}" for line in raw_lines)
+    if DISPLAY_NOTE_FORBIDDEN_RE.search(rendered):
+        raise ValueError("display_note contains low-value or editorial wording")
+    if _substantially_repeats_body(rendered, body):
+        raise ValueError("display_note repeats spoken paragraph")
+    return rendered
+
+
+def _validated_replacement(value: object, kind: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("note_only omitted replacement_markdown")
+    rendered = value.strip()
+    if len(_normalized_visible_text(rendered)) < 2 or len(rendered) > 5000:
+        raise ValueError("replacement_markdown is empty or unbounded")
+    if kind == "code" and "```" not in rendered:
+        raise ValueError("code replacement lacks fenced block")
+    if kind == "formula" and "$" not in rendered:
+        raise ValueError("formula replacement lacks LaTeX delimiters")
+    if kind == "table" and ("|" not in rendered or "\n" not in rendered):
+        raise ValueError("table replacement lacks Markdown structure")
+    if DISPLAY_NOTE_FORBIDDEN_RE.search(rendered):
+        raise ValueError("replacement contains unsupported editorial wording")
+    return rendered
+
+
+def _paragraph_visual_context(paragraph: Paragraph) -> str:
+    return "\n".join(
+        value.strip()
+        for value in (paragraph.heading, paragraph.subheading, paragraph.text)
+        if isinstance(value, str) and value.strip()
+    )
+
+
+def _is_low_value_video_text_overlay(
+    frame: Frame,
+    *,
+    kind: str,
+    confidence: str,
+    completeness: str,
+    density: str,
+) -> bool:
+    """Identify a complete text overlay whose underlying video still adds no structure."""
+    if not (
+        kind == "text"
+        and confidence == "high"
+        and completeness == "complete"
+        and density == "low"
+    ):
+        return False
+    description = re.sub(r"\s+", "", frame.vision_description)
+    video_or_person = re.search(
+        r"(?:短视频|视频截图|视频帧|人物|自拍|实拍|演讲画面|人物口述)",
+        description,
+    )
+    text_overlay = re.search(r"(?:叠加文字|顶部标题|标题文字|纯文字|字幕)", description)
+    no_structure = re.search(
+        r"(?:无|未出现|未见)[^。；\n]{0,100}(?:流程图|结构图|图表|表格|代码|公式|界面操作|论文原图)",
+        description,
+    )
+    return bool(video_or_person and text_overlay and no_structure)
+
+
+def _overlay_note_replacement(value: object, context: str) -> str:
+    """Keep useful overlay titles while discarding subtitles and platform chrome."""
+    if not isinstance(value, str):
+        return ""
+    points: list[str] = []
+    for line in value.splitlines():
+        line = re.sub(r"^\s*(?:[-*•]|\d+[.)、])\s*", "", line).strip()
+        for clause in re.split(r"[；;]", line):
+            clause = clause.strip()
+            if not clause or re.search(r"(?:字幕|水印|页码|播放控件|抖音号)", clause):
+                continue
+            clause = re.sub(r"^标题(?:显示|为|是)?\s*[:：]?\s*", "", clause).strip()
+            clause = clause.strip("“”\"'。，；;：: ")
+            if len(_normalized_visible_text(clause)) < 2:
+                continue
+            if (
+                len(_normalized_visible_text(clause)) >= 6
+                and _substantially_repeats_body(clause, context)
+            ):
+                continue
+            if clause not in points:
+                points.append(clause)
+    if not points:
+        return ""
+    return points[0] if len(points) == 1 else "\n".join(f"- {point}" for point in points[:2])
 
 
 def enrich_with_visual_evidence(
@@ -363,6 +483,8 @@ def enrich_with_visual_evidence(
             {
                 "item_id": item_id,
                 "timestamp": round(frame.timestamp, 2),
+                "nearby_heading": paragraph.heading,
+                "nearby_subheading": paragraph.subheading,
                 "spoken_paragraph": paragraph.text[:1400],
                 "ocr": frame.ocr_text[:1800],
                 "vision_description": frame.vision_description[:1400],
@@ -428,100 +550,120 @@ def enrich_with_visual_evidence(
                 if information_gain in {"none", "partial", "substantial"}
                 else "unknown"
             )
-            note = payload.get("visual_note")
             frame.paragraph_index = paragraph_index
             frame.content_kind = kind
             frame.evidence_confidence = confidence
             frame.evidence_completeness = completeness
             frame.information_density = density
             frame.information_gain = information_gain
-            if relevance != "high" or kind == "decorative" or information_gain == "none":
-                frame.keep_image = False
-                frame.extracted_markdown = ""
-                continue
+            frame.publish_mode = "image_only"
+            frame.replacement_markdown = ""
+            frame.display_note = ""
+            frame.extracted_markdown = ""
             frame.keep_image = True
-            publishable_visual_text = (
-                confidence == "high"
-                and completeness == "complete"
-                and (
-                    frame.ocr_confidence >= 50
-                    or len(frame.vision_description.strip()) >= 20
+            mode = str(payload.get("publish_mode") or "").strip().lower()
+            if mode not in PUBLISH_MODES:
+                raise ValueError("visual evidence omitted a valid publish_mode")
+
+            context = _paragraph_visual_context(paragraph)
+            forced_overlay_replacement = ""
+            if mode in {"image_only", "image_with_note"} and _is_low_value_video_text_overlay(
+                frame,
+                kind=kind,
+                confidence=confidence,
+                completeness=completeness,
+                density=density,
+            ):
+                forced_overlay_replacement = _overlay_note_replacement(
+                    payload.get("display_note") or payload.get("replacement_markdown"),
+                    context,
                 )
-            )
-            # A short, fully verified text/list screen can be redundant with
-            # the spoken paragraph.  In that case the classifier correctly
-            # returns visual_note=null because there is no screen-only fact;
-            # still remove the image instead of keeping a decorative duplicate.
-            redundant_complete_simple_text = (
-                publishable_visual_text
-                and kind in {"text", "list"}
-                and density in {"low", "medium"}
-                and len(re.sub(r"\s+", "", frame.ocr_text)) <= 300
-            )
-            if redundant_complete_simple_text:
+                mode = "note_only" if forced_overlay_replacement else "drop"
+
+            if mode == "drop":
+                if (
+                    not _is_low_value_video_text_overlay(
+                        frame,
+                        kind=kind,
+                        confidence=confidence,
+                        completeness=completeness,
+                        density=density,
+                    )
+                    and relevance == "high"
+                    and kind != "decorative"
+                    and information_gain != "none"
+                ):
+                    raise ValueError("drop conflicts with useful visual evidence")
+                frame.publish_mode = "drop"
                 frame.keep_image = False
-            short_transcribed_text = (
-                confidence == "high"
-                and kind in {"text", "list"}
-                and density in {"low", "medium"}
-                and note
-                and 8 <= len(re.sub(r"\s+", "", str(note))) <= 300
-                and (
-                    frame.ocr_confidence >= 50
-                    or len(frame.vision_description.strip()) >= 8
-                )
-            )
-            if (publishable_visual_text or short_transcribed_text) and note and len(str(note).strip()) >= 8:
-                rendered = str(note).strip()
-                if re.search(r"(?:这说明|价值在于|适合用来|形成互补|由此可见)", rendered):
-                    raise ValueError("visual evidence contains unsupported editorial commentary")
-                text_replaceable = kind in {"text", "list", "table", "code", "formula"}
-                keep_image = (
-                    not text_replaceable
+                continue
+
+            if mode == "note_only":
+                if (
+                    relevance != "high"
+                    or kind not in TEXT_REPLACEABLE_KINDS
                     or confidence != "high"
                     or completeness != "complete"
-                    or density == "high"
-                )
-                # Short pure-text/list slides are replaceable once the visual
-                # model has transcribed their useful content.  A cautious
-                # "partial" completeness label alone should not leave a
-                # decorative screenshot behind when the screen is low/medium
-                # density and the extracted note is short.  Dense prompts and
-                # long slides still retain the original image.
-                if (
-                    kind in {"text", "list"}
-                    and confidence == "high"
-                    and density in {"low", "medium"}
-                    and len(re.sub(r"\s+", "", rendered)) <= 300
+                    or information_gain == "none"
+                    or not (
+                        frame.ocr_confidence >= 50
+                        or len(frame.vision_description.strip()) >= 20
+                    )
                 ):
-                    keep_image = False
-                if kind == "code" and "```" not in rendered:
-                    keep_image = True
-                    warnings.append(f"paragraph {paragraph_index + 1}: code OCR lacked fenced block")
-                if kind == "formula" and "$" not in rendered:
-                    keep_image = True
-                    warnings.append(f"paragraph {paragraph_index + 1}: formula OCR lacked LaTeX delimiters")
-                if confidence == "low" and kind in {"code", "formula", "table"}:
-                    keep_image = True
-                    rendered = "⚠️ 识别结果待复核\n\n" + rendered
-                    warnings.append(
-                        f"REVIEW: paragraph {paragraph_index + 1} {kind} OCR confidence is low"
-                    )
-                existing_notes = paragraph.visual_note or ""
-                if rendered not in existing_notes:
-                    paragraph.visual_note = (
-                        existing_notes.rstrip() + "\n\n" + rendered
-                        if existing_notes.strip()
-                        else rendered
-                    )
-                frame.keep_image = keep_image
+                    raise ValueError("note_only evidence is not complete and reliable")
+                rendered = _validated_replacement(
+                    forced_overlay_replacement or payload.get("replacement_markdown"), kind
+                )
+                if (
+                    forced_overlay_replacement
+                    and len(_normalized_visible_text(rendered)) >= 6
+                    and _substantially_repeats_body(rendered, context)
+                ):
+                    frame.publish_mode = "drop"
+                    frame.keep_image = False
+                    continue
+                normalized_rendered = _normalized_visible_text(rendered)
+                duplicate = any(
+                    other.paragraph_index == paragraph_index
+                    and other.publish_mode == "note_only"
+                    and normalized_rendered
+                    == _normalized_visible_text(other.replacement_markdown)
+                    for other in frames
+                )
+                if duplicate:
+                    frame.publish_mode = "drop"
+                    frame.keep_image = False
+                    continue
+                frame.publish_mode = "note_only"
+                frame.replacement_markdown = rendered
                 frame.extracted_markdown = rendered
+                frame.keep_image = False
+                continue
+
+            if mode == "image_with_note":
+                if relevance != "high" or information_gain not in {"partial", "substantial"}:
+                    raise ValueError("image_with_note lacks new visual information")
+                frame.display_note = _validated_display_note(
+                    payload.get("display_note"), context
+                )
+                frame.publish_mode = "image_with_note"
+                frame.keep_image = True
+                continue
+
+            # image_only is the conservative successful mode.  It deliberately
+            # publishes neither replacement text nor a second description.
+            frame.publish_mode = "image_only"
+            frame.keep_image = True
         except Exception as exc:
             # The frame was already selected as the strongest temporally
             # aligned evidence for this paragraph. If classification or
             # transcription fails, retain the original instead of silently
             # discarding potentially indispensable visual information.
             frame.paragraph_index = paragraph_index
+            frame.publish_mode = "image_only"
+            frame.replacement_markdown = ""
+            frame.display_note = ""
+            frame.extracted_markdown = ""
             frame.keep_image = True
             frame.evidence_confidence = "low"
             frame.evidence_completeness = "unknown"

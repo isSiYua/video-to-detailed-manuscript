@@ -328,7 +328,13 @@ def bundle_job(
         selected.extend(source_files)
     exports = state_root() / "exports"
     exports.mkdir(parents=True, exist_ok=True)
-    archive = exports / f"{task['task_key']}-{task.get('bvid') or 'video'}-video-manuscript.zip"
+    archive_id = str(task.get("source_id") or task.get("bvid") or "source")
+    archive_kind = (
+        "video-manuscript"
+        if str(task.get("source_kind") or "video") == "video"
+        else "source-manuscript"
+    )
+    archive = exports / f"{task['task_key']}-{archive_id}-{archive_kind}.zip"
     top = job_dir.name
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as handle:
         handle.writestr((Path(top) / "assets").as_posix() + "/", b"")
@@ -527,6 +533,10 @@ def submit_detached(raw_argv: list[str]) -> dict[str, object]:
         "pid": process.pid,
         "task_number_source": "first_progress_message",
         "chat_session_released": True,
+        "assistant_reply": "已提交后台处理，任务编号将在第一条进度中显示。",
+        "assistant_reply_contract": "return_assistant_reply_verbatim_and_stop",
+        "progress_delivery": "out_of_band_only",
+        "progress_in_this_result": False,
     }
 
 
@@ -1233,6 +1243,7 @@ def main() -> int:
         elif args.command == "inspect":
             adapter = adapter_for(args.url)
             canonical = adapter.canonicalize_input(args.url)
+            adapter = adapter_for(canonical)
             info = adapter.inspect(canonical, args.part)
             if isinstance(adapter, DocumentSourceAdapter):
                 segments, transcript_meta = adapter.content_segments(info)
@@ -1277,6 +1288,7 @@ def main() -> int:
             if args.url:
                 adapter = adapter_for(args.url)
                 args.url = adapter.canonicalize_input(args.url)
+                adapter = adapter_for(args.url)
                 platform = adapter.platform
                 source_kind = adapter.source_kind
                 hinted_source_id = adapter.source_id_from_url(args.url)

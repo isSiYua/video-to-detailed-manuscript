@@ -26,9 +26,11 @@ def plan_frame_evidence_groups(
     paragraphs: list[Paragraph], frames: list[Frame]
 ) -> dict[int, list[Frame]]:
     """Retain every distinct visual item aligned to each paragraph."""
-    had_generated_notes = any(frame.extracted_markdown.strip() for frame in frames)
     aligned = sorted(
-        [frame for frame in frames if frame.paragraph_index is not None],
+        [
+            frame for frame in frames
+            if frame.paragraph_index is not None and frame.publish_mode != "drop"
+        ],
         key=lambda frame: frame.timestamp,
     )
 
@@ -83,9 +85,11 @@ def plan_frame_evidence_groups(
             continue
         if evidence_score(frame) > evidence_score(duplicate):
             duplicate.extracted_markdown = ""
+            duplicate.replacement_markdown = ""
             kept[kept.index(duplicate)] = frame
         else:
             frame.extracted_markdown = ""
+            frame.replacement_markdown = ""
 
     # Progressive PPT/whiteboard pages may accumulate annotations for several
     # minutes without changing template.  Within one semantic section, replace
@@ -124,9 +128,11 @@ def plan_frame_evidence_groups(
             replacement_index = index
             if frame_score > existing_score:
                 existing.extracted_markdown = ""
+                existing.replacement_markdown = ""
                 progressive_kept[index] = frame
             else:
                 frame.extracted_markdown = ""
+                frame.replacement_markdown = ""
             break
         if replacement_index is None:
             progressive_kept.append(frame)
@@ -139,18 +145,13 @@ def plan_frame_evidence_groups(
             continue
         groups.setdefault(paragraph_index, []).append(frame)
 
-    # Visual text belongs to the frame that proved it.  Rebuild generated notes
-    # after deduplication so dropping one duplicate never erases an unrelated
-    # list, code block, formula or slide transcription from the same paragraph.
-    if had_generated_notes:
-        for paragraph_index, paragraph in enumerate(paragraphs):
-            notes: list[str] = []
-            for frame in groups.get(paragraph_index, []):
-                note = frame.extracted_markdown.strip()
-                if note and note not in notes:
-                    notes.append(note)
-            paragraph.visual_note = "\n\n".join(notes) or None
     return groups
+
+
+def _append_visual_info(lines: list[str], content: str) -> None:
+    lines.append("> [!info] 画面补充")
+    lines.extend(">" if not line else f"> {line}" for line in content.splitlines())
+    lines.append("")
 
 
 def plan_frame_evidence(
@@ -219,15 +220,17 @@ def compose_markdown(
         if paragraph.subheading:
             lines.extend([f"### {paragraph.subheading}", ""])
         lines.extend([paragraph.text, ""])
-        if paragraph.visual_note:
-            lines.extend(["> [!info] 画面补充"])
-            lines.extend(f"> {line}" for line in paragraph.visual_note.splitlines())
-            lines.append("")
-        # Place every distinct, irreplaceable item immediately after the passage
-        # it explains.  Complete text-only frames are represented by the callout
-        # above and removed; diagrams, charts, UI and partial/dense screens remain.
+        # Publish each visual item independently.  This keeps replacement text
+        # and a retained image mutually exclusive and prevents several frames
+        # from being merged into one paragraph-level callout.
         for frame in frame_plan.get(paragraph_index, []):
-            if not frame.keep_image:
+            if frame.publish_mode == "note_only":
+                replacement = frame.replacement_markdown.strip()
+                if replacement:
+                    _append_visual_info(lines, replacement)
+                Path(frame.path).unlink(missing_ok=True)
+                continue
+            if frame.publish_mode == "drop":
                 Path(frame.path).unlink(missing_ok=True)
                 continue
             relative = Path(frame.path).relative_to(note_path.parent).as_posix()
@@ -255,6 +258,8 @@ def compose_markdown(
                 lines.extend([f"*{frame.locator_label or '原文图片'}*", ""])
             else:
                 lines.extend([f"*画面时间：{timestamp(frame.timestamp)}*", ""])
+            if frame.publish_mode == "image_with_note" and frame.display_note.strip():
+                _append_visual_info(lines, frame.display_note.strip())
     planned_ids = {id(frame) for group in frame_plan.values() for frame in group}
     for frame in frames:
         if id(frame) in planned_ids and frame.keep_image:

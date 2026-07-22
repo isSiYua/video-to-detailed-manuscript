@@ -164,6 +164,13 @@ def run(options: Options) -> dict[str, Any]:
             info = adapter.restore_info(metadata)
         else:
             detected = adapter_for(options.url)
+            canonical_url = options.url
+            if detected.platform in {"bilibili", "bilibili_opus"}:
+                canonical_url = detected.canonicalize_input(options.url)
+                # A b23 short link can resolve from the Bilibili video domain to
+                # an opus/column document. Re-run routing after resolution so a
+                # document is never forced through BV extraction.
+                detected = adapter_for(canonical_url)
             adapter = (
                 BilibiliSourceAdapter(BilibiliClient())
                 if detected.platform == "bilibili"
@@ -171,7 +178,7 @@ def run(options: Options) -> dict[str, Any]:
             )
             if not isinstance(adapter, (VideoSourceAdapter, DocumentSourceAdapter)):
                 raise RuntimeError(f"{adapter.platform} 不是已安装的来源适配器")
-            info = adapter.inspect(options.url, options.part)
+            info = adapter.inspect(canonical_url, options.part)
         is_video = isinstance(adapter, VideoSourceAdapter)
         is_document = isinstance(adapter, DocumentSourceAdapter)
         if is_video == is_document:
@@ -338,7 +345,7 @@ def run(options: Options) -> dict[str, Any]:
             )
         visual_meta["retained_image_count"] = kept_frame_count
         visual_meta["text_only_evidence_count"] = sum(
-            1 for frame in frames if frame.extracted_markdown and not frame.keep_image
+            1 for frame in frames if frame.publish_mode == "note_only"
         )
         write_artifacts(
             source_dir, metadata=metadata, segments=segments, transcript_meta=transcript_meta,

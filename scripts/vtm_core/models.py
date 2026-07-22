@@ -76,6 +76,9 @@ class Frame:
     contrast: float = 0.0
     paragraph_index: int | None = None
     content_kind: str = "other"
+    publish_mode: str = "image_only"
+    replacement_markdown: str = ""
+    display_note: str = ""
     keep_image: bool = True
     extracted_markdown: str = ""
     evidence_confidence: str = "unknown"
